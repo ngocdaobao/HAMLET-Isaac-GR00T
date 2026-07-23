@@ -1,0 +1,1 @@
+MODEL_PATH=vanilla_gr00t ROBOMME_PYTHON=robomme_benchmark/.venv/bin/python bash run_scripts/robomme/eval_n1d6_robomme.sh
