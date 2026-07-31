@@ -8,6 +8,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+
 class EagleBackbone(torch.nn.Module):
     def __init__(
         self,
@@ -230,7 +231,7 @@ class EagleBackbone(torch.nn.Module):
 
         image_mask = input_ids == eagle.image_token_index
 
-        text_mask = torch.ones(image_mask.shape, dtype=image_mask.dtype, device=image_mask.device) - image_mask
+        text_mask = torch.ones(image_mask.shape, dtype=image_mask.dtype, device=image_mask.device) - image_mask.long()
 
         image_mask = torch.cat(
             [image_mask, torch.zeros(B, n_q, dtype=image_mask.dtype, device=image_mask.device)],
