@@ -1158,6 +1158,8 @@ class Gr00tN1d6(PreTrainedModel):
  
         backbone_outputs = self.backbone(backbone_inputs)
 
+        logger.info(f"Backbone feature shape: {backbone_outputs['backbone_features'].shape}")
+
         # Cache memory in a dict with keys are episode index
         # if "_viz_episode_index" in backbone_inputs:
         #     # For caching, we need to know the episode index to reset memory at episode boundaries.
