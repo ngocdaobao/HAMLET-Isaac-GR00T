@@ -178,6 +178,10 @@ class EagleBackbone(torch.nn.Module):
         input_embeds_flat = input_embeds.reshape(B * N, C)
         input_ids_flat = input_ids.reshape(B * N)
         selected = input_ids_flat == eagle.image_token_index
+        # Image tokens length
+        logger.info(f"Image tokens idx: {eagle.image_token_index}, selected.sum(): {selected.sum()}, vit_embeds.shape: {vit_embeds.shape}")
+        img_token_len = vit_embeds.shape[1] # vit_embeds.shape (B, n_img_tokens, C)
+        text_token_len = input_ids_flat.shape[0] - img_token_len
         try:
             input_embeds_flat[selected] = input_embeds_flat[selected] * 0.0 + vit_embeds
         except Exception as e:
@@ -213,15 +217,33 @@ class EagleBackbone(torch.nn.Module):
             attention_mask=attention_mask_ext,
             position_ids=position_ids,
             output_hidden_states=True,
+            output_attentions=True,
             use_cache=False,
         )
+
+        attentions = outputs.attentions
+
         last_hidden = outputs.hidden_states[-1]  # (B, N+n_q, d)
 
         image_mask = input_ids == eagle.image_token_index
+
+        text_mask = torch.ones(image_mask.shape, dtype=image_mask.dtype, device=image_mask.device) - image_mask
+
         image_mask = torch.cat(
             [image_mask, torch.zeros(B, n_q, dtype=image_mask.dtype, device=image_mask.device)],
             dim=1,
         )
+
+        text_mask = torch.cat(
+            [text_mask, torch.zeros(B, n_q, dtype=text_mask.dtype, device=text_mask.device)],
+            dim=1,
+        )
+
+        text_to_img_attn = attentions[-1][:, :, text_mask.bool(), image_mask.bool()]  # (B, n_head, T_text, T_img)
+        # Normalize the attention across n_head
+        text_to_img_attn = text_to_img_attn / (text_to_img_attn.sum(dim=1, keepdim=True) + 1e-8)
+        text_to_img_attn = text_to_img_attn.mean(dim=1)  # (B, T_text, T_img)
+
         backbone_attention_mask = attention_mask_ext == 1
         return BatchFeature(
             data={
@@ -229,6 +251,7 @@ class EagleBackbone(torch.nn.Module):
                 "backbone_attention_mask": backbone_attention_mask,
                 "image_mask": image_mask,
                 "n_moment_tokens": n_q,
+                "text_to_img_attn": text_to_img_attn,
                 # "episode_index": episode_idx,
             }
         )

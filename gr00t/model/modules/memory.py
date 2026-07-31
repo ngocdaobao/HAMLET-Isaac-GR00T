@@ -133,7 +133,7 @@ class _Block(nn.Module):
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
-
+ 
 class MemoryTransformer(nn.Module):
     """Block-causal Transformer for HAMLET history aggregation.
 

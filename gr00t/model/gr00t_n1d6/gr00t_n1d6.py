@@ -224,6 +224,150 @@ class Gr00tN1d6ActionHead(nn.Module):
         sample = (1 - sample) * self.config.noise_s
         return sample
 
+    def process_mem_cache(
+        self, 
+        episode_ids, 
+        attn_score, 
+        action_inputs_B,
+        backbone_output
+    ):
+        backbone_features = backbone_output["backbone_features"] # (BK, N+n_q, C)
+        backbone_features = self.vlln(backbone_features)
+        backbone_output['backbone_features'] = backbone_features
+        K_target = self.memory_transformer.T
+        current_ep_in_cache = self.memory_pool.keys()
+        BK, _, d = backbone_features.shape 
+        B = action_inputs_B # batch_size
+        K = BK // B # num timesteps 
+        # K=1
+        if K !=1:
+            raise RuntimeError(f"Got K={K}, but expect K=1")
+
+        mem_batch = []
+
+        for ep_id in episode_ids:
+            if ep_id not in current_ep_in_cache:
+                self.memory_pool[ep_id] = {
+                    "mem_tokens": [],
+                    "trans_scores": [],
+                    "latest_attn": None
+                }
+
+        if (
+            self.use_hamlet
+            and self.memory_transformer is not None
+            and "n_moment_tokens" in backbone_output
+            and action_inputs_B is not None
+        ):
+            v_nq = self._mem_tokens_per_step  # 64
+            primary = backbone_output["primary_view_feature"]  # (BK, 64, d) K=1
+        
+        elif (
+            self.use_hamlet
+            and self.memory_transformer is not None
+            and "n_moment_tokens" in backbone_output
+            and action_inputs_B is not None
+        ):
+            v_nq = int(backbone_output["n_moment_tokens"])
+            primary = backbone_features[:, -v_nq:, :].contiguous().view(BK, v_nq, d)  # (BK, v_nq, d)
+
+
+        for idx, key in enumerate(episode_ids):
+            # Cache the memory tokens for each episode, select based on attn score
+            if len (self.memory_pool[key]['mem_tokens']) < K_targets:
+                self.memory_pool[key]['mem_tokens'].append(primary[idx]) 
+                self.memory_pool[key]['trans_scores'].append(attn_score[idx].mean().item())
+                self.memory_pool[key]['latest_attn'] = attn_score[idx]
+            else:
+                # If the memory pool is full, compute trans score by distance of current attn score
+                # to the latest attn score in the memory pool     
+                trans_score = (attn_score[idx] - self.memory_pool[key]['latest_attn']).abs().mean().item()
+                min_trans_score_idx = self.memory_pool[key]['trans_scores'].index(min(self.memory_pool[key]['trans_scores']))
+
+                if trans_score > self.memory_pool[key]['trans_scores'][min_trans_score_idx]:
+                    self.memory_pool[key]['mem_tokens'].pop(min_trans_score_idx)
+                    self.memory_pool[key]['trans_scores'].pop(min_trans_score_idx)
+
+                    self.memory_pool[key]['mem_tokens'].append(primary[idx])
+                    self.memory_pool[key]['trans_scores'].append(trans_score)
+
+            mem_tokens = torch.stack(self.memory_pool[key]['mem_tokens'], dim=0)  # (K, v_nq, d)
+            num_mem = mem_tokens.shape[0]
+            if num_mem < K_target:
+                # Pad with zeros if not enough memory tokens
+                pad_mem_tokens = mem_tokens[0].expand(K_target - num_mem, 1, 1)
+                mem_tokens = torch.cat([pad_mem_tokens,mem_tokens], dim=0) # (K_target, v_nq, d)
+                mem_tokens = mem_tokens.view(1, K_target * v_nq, d)  # (1, K_target*v_nq, d)
+                mem_batch.append(mem_tokens)
+        mem_batch = torch.cat(mem_batch, dim=0)  # (B, K_target*v_nq, d) or (B, K_target*nq, d)
+        
+        backbone_output['mem_emb'] = mem_batch
+       
+        return backbone_output
+        
+
+    def process_backbone_output_zoo(
+        self,
+        backbone_output: BatchFeature,
+        action_inputs_B: int | None = None,
+        mask_key_moment: torch.Tensor | None = None, # (B,)
+        reset_memory: torch.Tensor | None = None,
+    ) -> BatchFeature:
+
+        backbone_features = backbone_output["backbone_features"] # (B, N+v_nq, C)
+        mem_emb = backbone_output["mem_emb"] # (B, K_target*v_nq, d)
+        K_target = self.memory_transformer.T
+        v_nq = mem_emb.shape[1] // K_target
+        if backbone_features.shape[0] != mem_emb.shape[0]:
+            raise RuntimeError(f"Backbone features batch size {backbone_features.shape[0]} does not match memory embedding batch size {mem_emb.shape[0]}")
+
+        if mask_key_moment is not None:
+            key_moment_indices = (mask_key_moment == 1).int().bool()  # (B,)
+            mem_emb = mem_emb[key_moment_indices]  # (B_key, K*v_nq, d)
+        
+        mem_out = self.memory_transformer(mem_emb)
+        mem_aug = mem_out[:, -v_nq:, :]
+
+        if mask_key_moment is not None:
+            mem_aug_full = torch.zeros(B, v_nq, d, device=mem_aug.device, dtype=mem_aug.dtype)
+            mem_aug_full[key_moment_indices] = mem_aug
+            mem_aug = mem_aug_full   
+
+        current = backbone_features[:, :-v_nq, :]  # unchanged
+        am = (
+            backbone_output["backbone_attention_mask"].view(B, 1, -1)[:, -1, :]
+            if "backbone_attention_mask" in backbone_output
+            else None
+        )
+        im = (
+            backbone_output["image_mask"].view(B, 1, -1)[:, -1, :]
+            if "image_mask" in backbone_output
+            else None
+        )  
+
+        if self.mem_cond_type == "adaln":
+            mem_temb = self.mem_adaln_pool(mem_aug)
+            if mask_key_moment is not None:
+                mem_temb = mask_key_moment.view(B, 1) * mem_temb            
+            backbone_output["mem_temb_add"] = mem_temb
+        else:
+            current = torch.cat([current, mem_aug], dim=1)
+            if am is not None:
+                mem_am = am.new_ones(B, v_nq)
+                if mask_key_moment is not None:
+                    mem_am = mem_am & (mask_key_moment > 0).view(B, 1)
+                am = torch.cat([am, mem_am], dim=1)
+            if im is not None:
+                im = torch.cat([im, im.new_zeros(B, v_nq)], dim=1)
+            backbone_features = current
+            if am is not None:
+                backbone_output["backbone_attention_mask"] = am
+            if im is not None:
+                backbone_output["image_mask"] = im
+
+        backbone_output["backbone_features"] = backbone_features
+        return backbone_output
+
     def process_backbone_output(
         self,
         backbone_output: BatchFeature,
@@ -231,10 +375,12 @@ class Gr00tN1d6ActionHead(nn.Module):
         mask_key_moment: torch.Tensor | None = None, # (B,)
         reset_memory: torch.Tensor | None = None,
     ) -> BatchFeature:
+
         backbone_features = backbone_output["backbone_features"] # (B, N+n_q, C)
         backbone_features = self.vlln(backbone_features)
         # Expand shape of mask_key_moment to fit mem_aug
         # if maks_key_moment, use mem_aug, else, set to zeros
+
         if (
             self.use_hamlet
             and self.memory_transformer is not None
@@ -261,12 +407,18 @@ class Gr00tN1d6ActionHead(nn.Module):
                     f"memory augmentation."
                 )
             if K == K_target:
+                # Extract index of mask_key_moment == 1 for each sample in the batch
                 mem_seq = primary.view(B, K, v_nq, d).view(B, K * v_nq, d)
+                if mask_key_moment is not None:
+                    key_moment_indices = (mask_key_moment == 1).int().bool()  # (B,)
+                mem_seq = mem_seq[key_moment_indices]  # (B_key, K*v_nq, d)
                 mem_out = self.memory_transformer(mem_seq)
                 mem_aug = mem_out[:, -v_nq:, :]
+                # Restore if mask_key_moment is not None, else mem_aug is already correct
                 if mask_key_moment is not None:
-                    # (B,) -> (B,1,1): zero the memory tokens of non-key-moment rows.
-                    mem_aug = mask_key_moment.view(B, 1, 1) * mem_aug
+                    mem_aug_full = torch.zeros(B, v_nq, d, device=mem_aug.device, dtype=mem_aug.dtype)
+                    mem_aug_full[key_moment_indices] = mem_aug
+                    mem_aug = mem_aug_full
 
                 current = backbone_features.view(B, K, Tlen, d)[:, -1, :, :]  # unchanged
                 am = (
@@ -308,6 +460,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                     self._vision_cache = vis_current.repeat(1, K_target, 1)
                 elif reset_memory is not None and reset_memory.any():
                     defaults = vis_current.repeat(1, K_target, 1)
+                    # Shift, remove the v_nq oldest vision tokens, append the current step's vision tokens, and reset the memory for the
                     shifted = torch.cat([self._vision_cache[:, v_nq:, :], vis_current], dim=1)
                     reset_b = reset_memory.view(B, 1, 1).expand(B, K_target * v_nq, d)
                     self._vision_cache = torch.where(reset_b, defaults, shifted)
@@ -490,10 +643,20 @@ class Gr00tN1d6ActionHead(nn.Module):
         # collapse the B*K backbone rows back to B current-step rows after memory aggregation.
         B_target = action_input.state.shape[0]
         mask_key_moment = action_input.get("mask_key_moment", None)
+        row_keys = action_input.get("row_keys", None)
+        attn_score = backbone_output.get("text_to_img_attn", None)
+        backbone_output = self.process_mem_cache(
+            episode_ids=action_input.get("row_keys", None),
+            attn_score=backbone_output.get("text_to_img_attn", None),
+            action_inputs_B=B_target,
+            backbone_output=backbone_output
+        )
+
         backbone_output = self.process_backbone_output(
             backbone_output, 
             action_inputs_B=B_target, 
-            mask_key_moment=mask_key_moment
+            mask_key_moment=mask_key_moment,
+            row_keys=row_keys
         )
 
         # episode_index = backbone_output["episode_index"] # 
@@ -793,7 +956,7 @@ class Gr00tN1d6(PreTrainedModel):
 
         self.state_cache = dict()
         # Cache to plot image and delta for each episode. This is used to visualize the key-moment gate.
-        self.img_cache = dict() 
+        # self.img_cache = dict() 
         self.delta_cache = dict()
         # Key-moment gate (config-driven so eval inherits training's setting).
         self.use_key_moment_gate = getattr(config, "use_key_moment_gate", False)
@@ -953,8 +1116,10 @@ class Gr00tN1d6(PreTrainedModel):
             action_inputs["mask_key_moment"] = torch.tensor(
                 mask_key_moment, device=self.device, dtype=self.dtype
             )
-
-        return backbone_inputs, action_inputs
+        if row_keys is not None:
+            action_inputs["row_keys"] = row_keys
+            action_inputs["steps"] = steps
+        return backbone_inputs, action_inputs 
 
     def compute_window_delta(self, pos_pair: list[torch.Tensor]) -> int:
         """
@@ -987,6 +1152,9 @@ class Gr00tN1d6(PreTrainedModel):
 
         # Prepare inputs for backbone and action head
         backbone_inputs, action_inputs = self.prepare_input(inputs)
+
+        # Prepare mem token cache list for. The cache is keyed by episode index, so we can reset it at episode boundaries.
+                
  
         backbone_outputs = self.backbone(backbone_inputs)
 
