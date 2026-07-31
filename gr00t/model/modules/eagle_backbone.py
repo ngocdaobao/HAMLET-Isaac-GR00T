@@ -3,6 +3,9 @@ import os
 import torch
 from transformers import AutoConfig, AutoModel
 from transformers.feature_extraction_utils import BatchFeature
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class EagleBackbone(torch.nn.Module):

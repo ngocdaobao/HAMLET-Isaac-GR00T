@@ -288,7 +288,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                     self.memory_pool[key]['mem_tokens'].pop(min_trans_score_idx)
                     self.memory_pool[key]['trans_scores'].pop(min_trans_score_idx)
 
-                    self.memory_pool[key]['mem_tokens'].append(primary[idx])
+                    self.memory_pool[key]['mem_tokens'].append(primary[idx].clone())
                     self.memory_pool[key]['trans_scores'].append(trans_score)
 
             mem_tokens = torch.stack(self.memory_pool[key]['mem_tokens'], dim=0)  # (K, v_nq, d)
