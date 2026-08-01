@@ -332,12 +332,12 @@ class Gr00tN1d6ActionHead(nn.Module):
                     pool["step_ids"][lo] = self._zoo_tick if step is None else step
                     add_to_pool = True
             
-            viz_dir = f'runs/robomme/attn_logs/ep_{key}.txt'
-            if not os.path.exists(viz_dir):
-                os.makedirs(viz_dir)
-            
-            # Append to .txt file
-            with open(viz_dir, 'a') as f:
+            viz_dir = "runs/robomme/attn_logs"
+            os.makedirs(viz_dir, exist_ok=True)
+
+            viz_file = os.path.join(viz_dir, f"ep_{key}.txt")
+
+            with open(viz_file, "a") as f:
                 f.write(f"Step {step}: Trans_score {trans_score}, Added to pool: {add_to_pool}\n")
 
             # Oldest-first ordering: replacement scrambles insertion order, but the
