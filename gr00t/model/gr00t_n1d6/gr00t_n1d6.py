@@ -65,7 +65,11 @@ class Gr00tN1d6ActionHead(nn.Module):
     def __init__(self, config: Gr00tN1d6Config): 
         super().__init__()
 
-        self.memory_pool = dict() # cache memory token as dict with key as episode index and value as memory token
+        # zoo memory: per-episode pool of salient past moment-token sets, keyed by
+        # episode/session id. Populated across iterations, so it is NOT part of the
+        # module state dict (detached activations, not parameters).
+        self.memory_pool = dict()
+        self._zoo_tick = 0
         self.config = config
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
@@ -155,6 +159,9 @@ class Gr00tN1d6ActionHead(nn.Module):
         # memory-to-action conditioning. "cross_attn" (default) replaces the moment-token
         # tail of the action-head KV; "adaln" mean-pools the memory output through a
         # zero-init projection added to the DiT timestep embedding.
+        # "window": original HAMLET, K observations sampled per batch row.
+        # "zoo": one observation per iteration + attention-selected memory pool.
+        self.memory_mode = getattr(config, "memory_mode", "window")
         self.mem_cond_type = getattr(config, "mem_cond_type", "cross_attn")
         if (
             self.use_hamlet
@@ -225,147 +232,190 @@ class Gr00tN1d6ActionHead(nn.Module):
         return sample
 
     def process_mem_cache(
-        self, 
-        episode_ids, 
-        attn_score, 
-        action_inputs_B,
-        backbone_output
-    ):
-        backbone_features = backbone_output["backbone_features"] # (BK, N+n_q, C)
-        backbone_features = self.vlln(backbone_features)
-        backbone_output['backbone_features'] = backbone_features
+        self,
+        backbone_output: BatchFeature,
+        episode_ids: list,
+        steps: list | None = None,
+        action_inputs_B: int | None = None,
+        reset_memory: torch.Tensor | None = None,
+    ) -> BatchFeature:
+        """zoo memory selection.
+
+        One observation per iteration (K == 1). Each episode keeps a pool of at most
+        K_target-1 PAST moment-token sets, admitted by how much the observation's
+        attention map moved relative to the previous observation of that episode
+        (`trans_score`). A new observation displaces the pooled entry with the lowest
+        trans_score once the pool is full.
+
+        Writes `backbone_output["mem_seq"]` of shape (B, K_target*n_q, d), oldest block
+        first, with the CURRENT step's (gradient-carrying) tokens as the last block --
+        that is the ordering `MemoryTransformer` assumes.
+
+        Pooled entries are detached: they were produced by earlier iterations whose graph
+        is long freed, so keeping them live would either error out on the second backward
+        or silently retain the whole backbone graph. Gradient still reaches the backbone
+        through the current block.
+        """
+        n_q = int(backbone_output["n_moment_tokens"])
         K_target = self.memory_transformer.T
-        current_ep_in_cache = self.memory_pool.keys()
-        BK, _, d = backbone_features.shape 
-        B = action_inputs_B # batch_size
-        K = BK // B # num timesteps 
-        # K=1
-        if K !=1:
-            raise RuntimeError(f"Got K={K}, but expect K=1")
+        # vlln is applied ONCE, here, and process_backbone_output_zoo must not repeat it.
+        backbone_features = self.vlln(backbone_output["backbone_features"])
+        backbone_output["backbone_features"] = backbone_features
 
-        mem_batch = []
+        BK, _, d = backbone_features.shape
+        B = action_inputs_B if action_inputs_B is not None else BK
+        if BK != B:
+            raise RuntimeError(
+                f"zoo memory expects one observation per sample (K=1), got {BK} backbone "
+                f"rows for B={B}. Set video delta_indices to [0] for memory_mode='zoo'."
+            )
+        if episode_ids is None or len(episode_ids) != B:
+            raise RuntimeError(
+                "zoo memory needs one episode id per batch row (action_input['row_keys']); "
+                f"got {None if episode_ids is None else len(episode_ids)} for B={B}."
+            )
 
-        for ep_id in episode_ids:
-            if ep_id not in current_ep_in_cache:
-                self.memory_pool[ep_id] = {
-                    "mem_tokens": [],
-                    "trans_scores": [],
-                    "latest_attn": None
-                }
+        current = backbone_features[:, -n_q:, :]  # (B, n_q, d) -- live, keeps grad
+        attn_score = backbone_output.get("mem_attn_score", None)
+        if attn_score is None:
+            raise RuntimeError(
+                "zoo memory needs 'mem_attn_score' from the backbone; the backbone was "
+                "not built with memory_mode='zoo'."
+            )
+        if steps is None:
+            steps = [None] * B
 
-        if (
-            self.use_hamlet
-            and self.memory_transformer is not None
-            and "n_moment_tokens" in backbone_output
-            and action_inputs_B is not None
-        ):
-            v_nq = self._mem_tokens_per_step  # 64
-            primary = backbone_output["primary_view_feature"]  # (BK, 64, d) K=1
-        
-        elif (
-            self.use_hamlet
-            and self.memory_transformer is not None
-            and "n_moment_tokens" in backbone_output
-            and action_inputs_B is not None
-        ):
-            v_nq = int(backbone_output["n_moment_tokens"])
-            primary = backbone_features[:, -v_nq:, :].contiguous().view(BK, v_nq, d)  # (BK, v_nq, d)
-
-
+        self._zoo_tick += 1
+        mem_seq = []
         for idx, key in enumerate(episode_ids):
-            # Cache the memory tokens for each episode, select based on attn score
-            if len (self.memory_pool[key]['mem_tokens']) < K_targets:
-                self.memory_pool[key]['mem_tokens'].append(primary[idx]) 
-                self.memory_pool[key]['trans_scores'].append(attn_score[idx].mean().item())
-                self.memory_pool[key]['latest_attn'] = attn_score[idx]
+            pool = self.memory_pool.get(key)
+            step = steps[idx]
+            # New episode, an explicit reset, or the sampler restarting this demonstration
+            # (step index did not advance) -> the pool describes a different trajectory.
+            restart = (
+                pool is None
+                or (reset_memory is not None and bool(reset_memory[idx]))
+                or (step is not None and pool["last_step"] is not None and step <= pool["last_step"])
+            )
+            if restart:
+                pool = {"tokens": [], "scores": [], "step_ids": [], "prev_attn": None,
+                        "last_step": None}
+                self.memory_pool[key] = pool
+            pool["last_seen"] = self._zoo_tick
+
+            a = attn_score[idx]
+            if pool["prev_attn"] is None:
+                # First observation of the episode: no predecessor to compare against, so
+                # admit it unconditionally rather than scoring it on a different scale
+                # than every later candidate. Consequence: score=inf never wins the argmin,
+                # so the episode's first frame stays pinned as a start-of-episode anchor
+                # and only K_target-2 pool slots actually rotate. Set this to 0.0 instead
+                # if you would rather have all K_target-1 slots compete.
+                trans_score = float("inf")
             else:
-                # If the memory pool is full, compute trans score by distance of current attn score
-                # to the latest attn score in the memory pool     
-                trans_score = (attn_score[idx] - self.memory_pool[key]['latest_attn']).abs().mean().item()
-                min_trans_score_idx = self.memory_pool[key]['trans_scores'].index(min(self.memory_pool[key]['trans_scores']))
+                trans_score = (a - pool["prev_attn"]).abs().mean().item()
+            pool["prev_attn"] = a  # "most recent obs" must advance every step
+            pool["last_step"] = step
 
-                if trans_score > self.memory_pool[key]['trans_scores'][min_trans_score_idx]:
-                    self.memory_pool[key]['mem_tokens'].pop(min_trans_score_idx)
-                    self.memory_pool[key]['trans_scores'].pop(min_trans_score_idx)
+            tok = current[idx].detach()
+            if len(pool["tokens"]) < K_target - 1:
+                pool["tokens"].append(tok)
+                pool["scores"].append(trans_score)
+                pool["step_ids"].append(self._zoo_tick if step is None else step)
+            else:
+                lo = min(range(len(pool["scores"])), key=pool["scores"].__getitem__)
+                if trans_score > pool["scores"][lo]:
+                    pool["tokens"][lo] = tok
+                    pool["scores"][lo] = trans_score
+                    pool["step_ids"][lo] = self._zoo_tick if step is None else step
 
-                    self.memory_pool[key]['mem_tokens'].append(primary[idx].clone())
-                    self.memory_pool[key]['trans_scores'].append(trans_score)
+            # Oldest-first ordering: replacement scrambles insertion order, but the
+            # memory transformer's block-RoPE encodes temporal position, so the blocks
+            # must be re-sorted by their source step.
+            order = sorted(range(len(pool["tokens"])), key=lambda i: pool["step_ids"][i])
+            past = [pool["tokens"][i] for i in order]
+            if len(past) < K_target - 1:
+                # Warm-up: left-pad by repeating the oldest available block (or the
+                # current one when the pool is still empty).
+                oldest = past[0] if past else current[idx].detach()
+                past = [oldest] * (K_target - 1 - len(past)) + past
+            mem_seq.append(torch.stack(past + [current[idx]], dim=0))  # (K_target, n_q, d)
 
-            mem_tokens = torch.stack(self.memory_pool[key]['mem_tokens'], dim=0)  # (K, v_nq, d)
-            num_mem = mem_tokens.shape[0]
-            if num_mem < K_target:
-                # Pad with zeros if not enough memory tokens
-                pad_mem_tokens = mem_tokens[0].expand(K_target - num_mem, 1, 1)
-                mem_tokens = torch.cat([pad_mem_tokens,mem_tokens], dim=0) # (K_target, v_nq, d)
-                mem_tokens = mem_tokens.view(1, K_target * v_nq, d)  # (1, K_target*v_nq, d)
-                mem_batch.append(mem_tokens)
-        mem_batch = torch.cat(mem_batch, dim=0)  # (B, K_target*v_nq, d) or (B, K_target*nq, d)
-        
-        backbone_output['mem_emb'] = mem_batch
-       
+        self._evict_zoo_pool()
+        backbone_output["mem_seq"] = torch.stack(mem_seq, dim=0).view(B, K_target * n_q, d)
         return backbone_output
-        
+
+    def _evict_zoo_pool(self):
+        """Bound the pool: it is keyed by episode and would otherwise grow to hold every
+        episode in the dataset (K_target-1 x n_q x d floats each) for the whole run."""
+        limit = getattr(self.config, "zoo_max_episodes", 4096)
+        if len(self.memory_pool) <= limit:
+            return
+        stale = sorted(self.memory_pool, key=lambda k: self.memory_pool[k]["last_seen"])
+        for key in stale[: len(self.memory_pool) - limit]:
+            del self.memory_pool[key]
+
+    def reset_zoo_memory(self, episode_ids=None):
+        """Drop cached observations (all episodes, or the given ones). Call at rollout
+        boundaries so a new evaluation episode does not inherit the previous one."""
+        if episode_ids is None:
+            self.memory_pool.clear()
+        else:
+            for key in episode_ids:
+                self.memory_pool.pop(key, None)
+
 
     def process_backbone_output_zoo(
         self,
         backbone_output: BatchFeature,
-        action_inputs_B: int | None = None,
-        mask_key_moment: torch.Tensor | None = None, # (B,)
-        reset_memory: torch.Tensor | None = None,
+        mask_key_moment: torch.Tensor | None = None,  # (B,)
     ) -> BatchFeature:
+        """Aggregate the zoo memory sequence and splice it back exactly like the
+        original HAMLET K==1 moment-token path.
 
-        backbone_features = backbone_output["backbone_features"] # (B, N+v_nq, C)
-        mem_emb = backbone_output["mem_emb"] # (B, K_target*v_nq, d)
+        `backbone_features` is already vlln'd by `process_mem_cache` -- do NOT normalize
+        again here.
+        """
+        backbone_features = backbone_output["backbone_features"]  # (B, N+n_q, d)
+        mem_seq = backbone_output["mem_seq"]  # (B, K_target*n_q, d)
         K_target = self.memory_transformer.T
-        v_nq = mem_emb.shape[1] // K_target
-        if backbone_features.shape[0] != mem_emb.shape[0]:
-            raise RuntimeError(f"Backbone features batch size {backbone_features.shape[0]} does not match memory embedding batch size {mem_emb.shape[0]}")
+        n_q = mem_seq.shape[1] // K_target
+        B, _, d = backbone_features.shape
+        if mem_seq.shape[0] != B:
+            raise RuntimeError(
+                f"mem_seq batch {mem_seq.shape[0]} != backbone batch {B}"
+            )
 
+        mem_aug = self.memory_transformer(mem_seq)[:, -n_q:, :]  # (B, n_q, d)
         if mask_key_moment is not None:
-            key_moment_indices = (mask_key_moment == 1).int().bool()  # (B,)
-            mem_emb = mem_emb[key_moment_indices]  # (B_key, K*v_nq, d)
-        
-        mem_out = self.memory_transformer(mem_emb)
-        mem_aug = mem_out[:, -v_nq:, :]
-
-        if mask_key_moment is not None:
-            mem_aug_full = torch.zeros(B, v_nq, d, device=mem_aug.device, dtype=mem_aug.dtype)
-            mem_aug_full[key_moment_indices] = mem_aug
-            mem_aug = mem_aug_full   
-
-        current = backbone_features[:, :-v_nq, :]  # unchanged
-        am = (
-            backbone_output["backbone_attention_mask"].view(B, 1, -1)[:, -1, :]
-            if "backbone_attention_mask" in backbone_output
-            else None
-        )
-        im = (
-            backbone_output["image_mask"].view(B, 1, -1)[:, -1, :]
-            if "image_mask" in backbone_output
-            else None
-        )  
+            mem_aug = mask_key_moment.view(B, 1, 1).to(mem_aug.dtype) * mem_aug
 
         if self.mem_cond_type == "adaln":
+            # Gate the pooled vector, not just the tokens: the pool has a learned bias,
+            # so pool(zeros) != 0.
             mem_temb = self.mem_adaln_pool(mem_aug)
             if mask_key_moment is not None:
-                mem_temb = mask_key_moment.view(B, 1) * mem_temb            
+                mem_temb = mask_key_moment.view(B, 1).to(mem_temb.dtype) * mem_temb
             backbone_output["mem_temb_add"] = mem_temb
+            backbone_output["backbone_features"] = backbone_features[:, :-n_q, :]
+            if "backbone_attention_mask" in backbone_output:
+                backbone_output["backbone_attention_mask"] = backbone_output[
+                    "backbone_attention_mask"
+                ][:, :-n_q]
+            if "image_mask" in backbone_output:
+                backbone_output["image_mask"] = backbone_output["image_mask"][:, :-n_q]
         else:
-            current = torch.cat([current, mem_aug], dim=1)
-            if am is not None:
-                mem_am = am.new_ones(B, v_nq)
-                if mask_key_moment is not None:
-                    mem_am = mem_am & (mask_key_moment > 0).view(B, 1)
-                am = torch.cat([am, mem_am], dim=1)
-            if im is not None:
-                im = torch.cat([im, im.new_zeros(B, v_nq)], dim=1)
-            backbone_features = current
-            if am is not None:
-                backbone_output["backbone_attention_mask"] = am
-            if im is not None:
-                backbone_output["image_mask"] = im
-
-        backbone_output["backbone_features"] = backbone_features
+            # cross_attn: memory-augmented tokens replace the moment-token tail.
+            backbone_output["backbone_features"] = torch.cat(
+                [backbone_features[:, :-n_q, :], mem_aug], dim=1
+            )
+            if mask_key_moment is not None and "backbone_attention_mask" in backbone_output:
+                # Masked rows must not attend to their (zeroed) memory tokens, else the
+                # zero-key tokens act as attention sinks.
+                am = backbone_output["backbone_attention_mask"]
+                backbone_output["backbone_attention_mask"] = torch.cat(
+                    [am[:, :-n_q], am[:, -n_q:] & (mask_key_moment > 0).view(B, 1)], dim=1
+                )
         return backbone_output
 
     def process_backbone_output(
@@ -409,13 +459,16 @@ class Gr00tN1d6ActionHead(nn.Module):
             if K == K_target:
                 # Extract index of mask_key_moment == 1 for each sample in the batch
                 mem_seq = primary.view(B, K, v_nq, d).view(B, K * v_nq, d)
+                key_moment_indices = None
                 if mask_key_moment is not None:
-                    key_moment_indices = (mask_key_moment == 1).int().bool()  # (B,)
-                mem_seq = mem_seq[key_moment_indices]  # (B_key, K*v_nq, d)
+                    # Run the memory transformer on key-moment rows only, then scatter
+                    # back; non-key rows keep zero memory.
+                    key_moment_indices = (mask_key_moment == 1).view(-1)
+                    mem_seq = mem_seq[key_moment_indices]  # (B_key, K*v_nq, d)
                 mem_out = self.memory_transformer(mem_seq)
                 mem_aug = mem_out[:, -v_nq:, :]
                 # Restore if mask_key_moment is not None, else mem_aug is already correct
-                if mask_key_moment is not None:
+                if key_moment_indices is not None:
                     mem_aug_full = torch.zeros(B, v_nq, d, device=mem_aug.device, dtype=mem_aug.dtype)
                     mem_aug_full[key_moment_indices] = mem_aug
                     mem_aug = mem_aug_full
@@ -643,21 +696,25 @@ class Gr00tN1d6ActionHead(nn.Module):
         # collapse the B*K backbone rows back to B current-step rows after memory aggregation.
         B_target = action_input.state.shape[0]
         mask_key_moment = action_input.get("mask_key_moment", None)
-        row_keys = action_input.get("row_keys", None)
-        attn_score = backbone_output.get("text_to_img_attn", None)
-        backbone_output = self.process_mem_cache(
-            episode_ids=action_input.get("row_keys", None),
-            attn_score=backbone_output.get("text_to_img_attn", None),
-            action_inputs_B=B_target,
-            backbone_output=backbone_output
-        )
 
-        backbone_output = self.process_backbone_output(
-            backbone_output, 
-            action_inputs_B=B_target, 
-            mask_key_moment=mask_key_moment,
-            row_keys=row_keys
-        )
+        if self.use_hamlet and self.memory_mode == "zoo" and self.memory_transformer is not None:
+            backbone_output = self.process_mem_cache(
+                backbone_output,
+                episode_ids=action_input.get("row_keys", None),
+                steps=action_input.get("steps", None),
+                action_inputs_B=B_target,
+                reset_memory=action_input.get("reset_memory", None),
+            )
+            backbone_output = self.process_backbone_output_zoo(
+                backbone_output,
+                mask_key_moment=mask_key_moment,
+            )
+        else:
+            backbone_output = self.process_backbone_output(
+                backbone_output,
+                action_inputs_B=B_target,
+                mask_key_moment=mask_key_moment,
+            )
 
         # episode_index = backbone_output["episode_index"] # 
         # logger.info(f"Episode index from backbone output: {episode_index}")
@@ -766,12 +823,27 @@ class Gr00tN1d6ActionHead(nn.Module):
         """
         B_target = action_input.state.shape[0]
         mask_key_moment = action_input.get("mask_key_moment", None)
-        backbone_output = self.process_backbone_output(
-            backbone_output,
-            action_inputs_B=B_target,
-            mask_key_moment=mask_key_moment,
-            reset_memory=reset_memory,
-        )
+        if self.use_hamlet and self.memory_mode == "zoo" and self.memory_transformer is not None:
+            # Inference uses the same episode-keyed pool; the rollout calls once per
+            # n_action_steps, which is exactly the training-time stride.
+            backbone_output = self.process_mem_cache(
+                backbone_output,
+                episode_ids=action_input.get("row_keys", None),
+                steps=action_input.get("steps", None),
+                action_inputs_B=B_target,
+                reset_memory=reset_memory,
+            )
+            backbone_output = self.process_backbone_output_zoo(
+                backbone_output,
+                mask_key_moment=mask_key_moment,
+            )
+        else:
+            backbone_output = self.process_backbone_output(
+                backbone_output,
+                action_inputs_B=B_target,
+                mask_key_moment=mask_key_moment,
+                reset_memory=reset_memory,
+            )
 
         # Get vision and language embeddings.
         vl_embeds = backbone_output.backbone_features
@@ -979,6 +1051,8 @@ class Gr00tN1d6(PreTrainedModel):
         if getattr(config, "hamlet_mode", "off") != "off":
             mem_type = getattr(config, "memory_type", "moment_token")
             backbone_kwargs["memory_type"] = mem_type
+            # Only "zoo" makes the backbone compute the attention saliency descriptor.
+            backbone_kwargs["memory_mode"] = getattr(config, "memory_mode", "window")
             if mem_type == "vision_feature":
                 backbone_kwargs["n_moment_tokens"] = 0
                 backbone_kwargs["freeze_moment_tokens"] = False
@@ -1068,10 +1142,13 @@ class Gr00tN1d6(PreTrainedModel):
 
 
         mask_key_moment = None
-        if self.use_key_moment_gate:
-            states = action_inputs.state[:, :, :7].squeeze(1)  # (B, 7) normalized joint angles
-            ep_idx = backbone_inputs.get("_viz_episode_index", None)
-            step_idx = backbone_inputs.get("_viz_step_index", None)
+        steps = None
+        # Row identity is needed by the key-moment gate AND by the zoo memory pool, which
+        # is keyed by episode -- so resolve it whenever either is active.
+        needs_row_keys = self.use_key_moment_gate or getattr(self.config, "memory_mode", "window") == "zoo"
+        ep_idx = backbone_inputs.get("_viz_episode_index", None)
+        step_idx = backbone_inputs.get("_viz_step_index", None)
+        if needs_row_keys:
             if session_keys is not None:
                 row_keys = list(session_keys)
             elif ep_idx is not None:
@@ -1087,6 +1164,10 @@ class Gr00tN1d6(PreTrainedModel):
                 for idx, flag in enumerate(list(reset_state)):
                     if bool(flag):
                         self.state_cache.pop(row_keys[idx], None)
+                        self.action_head.memory_pool.pop(row_keys[idx], None)
+
+        if row_keys is not None and self.use_key_moment_gate:
+            states = action_inputs.state[:, :, :7].squeeze(1)  # (B, 7) normalized joint angles
             mask_key_moment = [0] * len(row_keys)
             for idx, key in enumerate(row_keys):
                 prev = self.state_cache.get(key)
@@ -1153,24 +1234,10 @@ class Gr00tN1d6(PreTrainedModel):
         # Prepare inputs for backbone and action head
         backbone_inputs, action_inputs = self.prepare_input(inputs)
 
-        # Prepare mem token cache list for. The cache is keyed by episode index, so we can reset it at episode boundaries.
-                
- 
         backbone_outputs = self.backbone(backbone_inputs)
 
-        logger.info(f"Backbone feature shape: {backbone_outputs['backbone_features'].shape}")
-
-        # Cache memory in a dict with keys are episode index
-        # if "_viz_episode_index" in backbone_inputs:
-        #     # For caching, we need to know the episode index to reset memory at episode boundaries.
-        #     episode_idx = list(backbone_inputs["_viz_episode_index"])
-        #     for ep in episode_idx:
-        #         if ep not in self.memory_cache:
-        #             # Initialize memory cache for new episode
-        #             self.memory_cache[ep] = [backbone_outputs["backbone_features"].detach()]
-        #         else:
-        #             self.memory_cache[ep].append(backbone_outputs["backbone_features"].detach())
-
+        # memory_mode="zoo": the action head owns the per-episode observation pool and
+        # assembles the memory window from it (see Gr00tN1d6ActionHead.process_mem_cache).
         action_outputs = self.action_head(backbone_outputs, action_inputs)
 
         return action_outputs

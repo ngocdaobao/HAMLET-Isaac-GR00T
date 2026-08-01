@@ -107,6 +107,8 @@ if __name__ == "__main__":
     config.model.memory_stride = ft_config.memory_stride
     config.model.mem_cond_type = ft_config.mem_cond_type
     config.model.memory_type = ft_config.memory_type
+    config.model.memory_mode = ft_config.memory_mode
+    config.model.zoo_max_episodes = ft_config.zoo_max_episodes
     config.model.use_key_moment_gate = ft_config.use_key_moment_gate
     config.model.delta_threshold = ft_config.delta_threshold
     if (
@@ -124,11 +126,39 @@ if __name__ == "__main__":
     config.training.load_moment_tokens_from = ft_config.load_moment_tokens_from
 
     # HAMLET — override video delta_indices on the registered modality configs.
-    if ft_config.hamlet_mode == "finetune" and ft_config.memory_window > 1:
+    if ft_config.hamlet_mode == "finetune" and ft_config.memory_mode == "zoo":
+        # zoo: ONE observation per sample. The memory window is assembled across
+        # iterations instead of within a batch row, so the temporal spacing has to come
+        # from the anchor sampler: strictly sequential anchors, memory_stride apart.
+        from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
+        for tag in MODALITY_CONFIGS:
+            if "video" in MODALITY_CONFIGS[tag]:
+                MODALITY_CONFIGS[tag]["video"].delta_indices = [0]
+        config.data.allow_padding = True
+        if not ft_config.sequential_anchors:
+            print(
+                "[HAMLET-ZOO][WARN] memory_mode='zoo' requires sequential_anchors=True "
+                "(otherwise consecutive iterations are unrelated frames and the cache is "
+                "meaningless) — forcing it on."
+            )
+            config.data.sequential_anchors = True
+        if ft_config.anchor_stride != ft_config.memory_stride:
+            print(
+                f"[HAMLET-ZOO][WARN] anchor_stride={ft_config.anchor_stride} != "
+                f"memory_stride={ft_config.memory_stride}; the gap between consecutive "
+                f"iterations must equal memory_stride — forcing anchor_stride="
+                f"{ft_config.memory_stride}."
+            )
+            config.data.anchor_stride = ft_config.memory_stride
+        print(
+            f"[HAMLET-ZOO] single-obs batching: delta_indices=[0] "
+            f"K_target={ft_config.memory_window} stride={ft_config.memory_stride}"
+        )
+    elif ft_config.hamlet_mode == "finetune" and ft_config.memory_window > 1:
         from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
         stride = ft_config.memory_stride
         K = ft_config.memory_window
-        new_indices = [-(K - 1 - i) * stride for i in range(K)] 
+        new_indices = [-(K - 1 - i) * stride for i in range(K)]
         # (-48,-32,-16,-0) for K=4, stride=16
         for tag in MODALITY_CONFIGS:
             if "video" in MODALITY_CONFIGS[tag]:

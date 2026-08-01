@@ -122,6 +122,13 @@ class Gr00tN1d6Config(PretrainedConfig):
     mem_cond_type: str = "cross_attn"
     # What flows through the memory module: {"moment_token", "vision_feature"}.
     memory_type: str = "moment_token"
+    # How the memory window is filled: {"window", "zoo"}.
+    #   "window": K observations per batch row (video delta_indices spans the window).
+    #   "zoo": one observation per iteration; the window is assembled across iterations
+    #       from a per-episode cache of the most transitional past observations.
+    # Persisted to the checkpoint config so evaluation inherits the same behavior.
+    memory_mode: str = "window"
+    zoo_max_episodes: int = 4096
     # Key-moment gate: when True, memory is zeroed out on non-key-moment steps
     # (window-end joint-state delta >= delta_threshold). When False, memory is
     # never gated -> plain HAMLET. Persisted to the checkpoint config so eval

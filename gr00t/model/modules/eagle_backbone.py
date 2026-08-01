@@ -8,6 +8,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Rotary embedding on (B, H, L, Dh) with (B, 1, L, Dh) cos/sin."""
+    half = x.shape[-1] // 2
+    rotated = torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+    return x * cos.to(x.dtype) + rotated * sin.to(x.dtype)
+
 
 class EagleBackbone(torch.nn.Module):
     def __init__(
@@ -26,6 +32,7 @@ class EagleBackbone(torch.nn.Module):
         n_moment_tokens: int = 0,
         freeze_moment_tokens: bool = False,
         memory_type: str = "moment_token",
+        memory_mode: str = "window",
     ):
         """
         EagleBackbone is to generate n_queries to represent the future action hidden states.
@@ -64,6 +71,9 @@ class EagleBackbone(torch.nn.Module):
 
         self.select_layer = select_layer
         self.memory_type = memory_type
+        # "zoo": single-observation-per-iteration memory with an attention-saliency cache.
+        # Only this mode pays for the extra last-layer attention read-out.
+        self.memory_mode = memory_mode
 
         # HAMLET moment tokens, created here in __init__ so `from_pretrained` does not
         # leave them uninitialized. Stored on the backbone for use by the TCL (Stage-1)
@@ -182,10 +192,6 @@ class EagleBackbone(torch.nn.Module):
         input_embeds_flat = input_embeds.reshape(B * N, C)
         input_ids_flat = input_ids.reshape(B * N)
         selected = input_ids_flat == eagle.image_token_index
-        # Image tokens length
-        logger.info(f"Image tokens idx: {eagle.image_token_index}, selected.sum(): {selected.sum()}, vit_embeds.shape: {vit_embeds.shape}")
-        img_token_len = vit_embeds.shape[1] # vit_embeds.shape (B, n_img_tokens, C)
-        text_token_len = input_ids_flat.shape[0] - img_token_len
         try:
             input_embeds_flat[selected] = input_embeds_flat[selected] * 0.0 + vit_embeds
         except Exception as e:
@@ -221,41 +227,123 @@ class EagleBackbone(torch.nn.Module):
             attention_mask=attention_mask_ext,
             position_ids=position_ids,
             output_hidden_states=True,
-            output_attentions=True,
             use_cache=False,
         )
-
-        attentions = outputs.attentions
 
         last_hidden = outputs.hidden_states[-1]  # (B, N+n_q, d)
 
         image_mask = input_ids == eagle.image_token_index
-
-        text_mask = torch.ones(image_mask.shape, dtype=image_mask.dtype, device=image_mask.device) - image_mask.long()
-
         image_mask = torch.cat(
             [image_mask, torch.zeros(B, n_q, dtype=image_mask.dtype, device=image_mask.device)],
             dim=1,
         )
 
-        text_mask = torch.cat(
-            [text_mask, torch.zeros(B, n_q, dtype=text_mask.dtype, device=text_mask.device)],
-            dim=1,
-        )
+        data = {
+            "backbone_features": last_hidden,
+            "backbone_attention_mask": attention_mask_ext == 1,
+            "image_mask": image_mask,
+            "n_moment_tokens": n_q,
+            # "episode_index": episode_idx,
+        }
 
-        text_to_img_attn = attentions[-1][:, :, text_mask.bool(), image_mask.bool()]  # (B, n_head, T_text, T_img)
-        # Normalize the attention across n_head
-        text_to_img_attn = text_to_img_attn / (text_to_img_attn.sum(dim=1, keepdim=True) + 1e-8)
-        text_to_img_attn = text_to_img_attn.mean(dim=1)  # (B, T_text, T_img)
+        if self.memory_mode == "zoo":
+            # Saliency descriptor for the zoo memory cache: how the moment tokens spread
+            # their last-layer attention over the image tokens.
+            # NOTE: `output_attentions=True` is NOT usable here. Eagle3-VL asserts
+            # flash_attention_2 for the LM, and FA2 never materializes the attention
+            # matrix, so HF returns None for `outputs.attentions` (or silently falls back
+            # to eager, which materializes a (B, H, L, L) tensor per layer -> OOM at these
+            # sequence lengths). Instead recompute the final layer's attention exactly,
+            # for the n_q moment-token query rows only.
+            attn_map = self._moment_to_image_attention(
+                hidden_in=outputs.hidden_states[-2],
+                position_ids=position_ids,
+                attention_mask_ext=attention_mask_ext,
+                image_mask_ext=image_mask,
+                n_q=n_q,
+            )
+            if attn_map is None:
+                # Fallback descriptor: L2-normalized mean image-token hidden state. Not an
+                # attention map, but it still measures "how much the observation changed".
+                img_feat = last_hidden[image_mask.bool()].view(B, -1, last_hidden.shape[-1])
+                attn_map = torch.nn.functional.normalize(
+                    img_feat.float().mean(dim=1), dim=-1
+                ).unsqueeze(1)
+            data["mem_attn_score"] = attn_map.detach()  # (B, n_q, n_img) or (B, 1, d)
 
-        backbone_attention_mask = attention_mask_ext == 1
-        return BatchFeature(
-            data={
-                "backbone_features": last_hidden,
-                "backbone_attention_mask": backbone_attention_mask,
-                "image_mask": image_mask,
-                "n_moment_tokens": n_q,
-                "text_to_img_attn": text_to_img_attn,
-                # "episode_index": episode_idx,
-            }
-        )
+        return BatchFeature(data=data)
+
+    @torch.no_grad()
+    def _moment_to_image_attention(
+        self,
+        hidden_in: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask_ext: torch.Tensor,
+        image_mask_ext: torch.Tensor,
+        n_q: int,
+    ):
+        """Exact last-decoder-layer attention from the moment tokens to the image tokens.
+
+        `hidden_in` is hidden_states[-2] -- the input to the final decoder layer -- so
+        re-running that layer's input_layernorm and q/k projections reproduces its
+        attention logits exactly. Only n_q query rows are computed, so this costs one
+        (B, H, n_q, L) matmul instead of a full (B, H, L, L) attention matrix.
+
+        Returns (B, n_q, n_img) probabilities renormalized over the image tokens, or None
+        if the LM internals don't match the expected Qwen-style layout.
+        """
+        try:
+            lm = self.model.language_model.model
+            layer = lm.layers[-1]
+            attn = layer.self_attn
+
+            h = layer.input_layernorm(hidden_in)  # (B, L, C)
+            B, L, _ = h.shape
+            head_dim = getattr(attn, "head_dim", None)
+            if head_dim is None:
+                head_dim = attn.q_proj.out_features // attn.config.num_attention_heads
+
+            q = attn.q_proj(h[:, -n_q:, :]).view(B, n_q, -1, head_dim)
+            k = attn.k_proj(h).view(B, L, -1, head_dim)
+            # Qwen3 normalizes each head before RoPE; Qwen2/Llama have no q_norm/k_norm.
+            if getattr(attn, "q_norm", None) is not None:
+                q = attn.q_norm(q)
+            if getattr(attn, "k_norm", None) is not None:
+                k = attn.k_norm(k)
+            q = q.transpose(1, 2)  # (B, H, n_q, Dh)
+            k = k.transpose(1, 2)  # (B, H_kv, L, Dh)
+
+            rotary = getattr(lm, "rotary_emb", None)
+            if rotary is not None:
+                cos, sin = rotary(h, position_ids)  # (B, L, Dh)
+                cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)  # (B, 1, L, Dh)
+                q = _apply_rope(q, cos[:, :, -n_q:, :], sin[:, :, -n_q:, :])
+                k = _apply_rope(k, cos, sin)
+
+            # GQA: broadcast the kv heads up to the query heads.
+            n_rep = q.shape[1] // k.shape[1]
+            if n_rep > 1:
+                k = k.repeat_interleave(n_rep, dim=1)
+
+            logits = torch.matmul(q.float(), k.float().transpose(-1, -2)) / (head_dim**0.5)
+            # The moment tokens sit after the right padding, so pad columns must be masked
+            # out before the softmax or they steal probability mass.
+            logits = logits.masked_fill(
+                ~attention_mask_ext.bool()[:, None, None, :], torch.finfo(logits.dtype).min
+            )
+            probs = torch.softmax(logits, dim=-1).mean(dim=1)  # over heads -> (B, n_q, L)
+
+            img_mask = image_mask_ext.bool()
+            n_img = int(img_mask[0].sum().item())
+            if n_img == 0 or not bool((img_mask.sum(dim=1) == n_img).all()):
+                return None  # ragged image-token counts -> no fixed-width descriptor
+            img_probs = probs[img_mask.unsqueeze(1).expand(-1, n_q, -1)].view(B, n_q, n_img)
+            # Renormalize over image tokens so the L1 distance between two timesteps
+            # reflects *where* attention moved, not the text/image mass ratio.
+            return img_probs / (img_probs.sum(dim=-1, keepdim=True) + 1e-8)
+        except Exception as e:  # depends on the installed transformers internals
+            logger.warning(
+                f"[zoo] moment->image attention read-out unavailable "
+                f"({type(e).__name__}: {e}); using hidden-state descriptor instead."
+            )
+            return None

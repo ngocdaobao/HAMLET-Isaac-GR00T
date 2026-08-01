@@ -280,6 +280,20 @@ def _resolve_memory_params(cfg: Config) -> tuple[int, int]:
                     f"train/inference parity."
                 )
                 stride = int(trained_stride)
+            mode = mc.get("memory_mode", "window")
+            if mode == "zoo":
+                # zoo assembles its window across policy CALLS from a per-episode pool,
+                # keyed by session id and reset via reset_memory -- the same call cadence
+                # the priming loop below already uses, so priming needs no change. The
+                # n_action_steps == memory_stride check above is what keeps the
+                # inter-call spacing equal to the trained one.
+                print(
+                    f"[i] memory_mode=zoo: window assembled across calls from the "
+                    f"attention-selected pool (K_target={K}); priming supplies the first "
+                    f"{max(0, K - 1)} observations."
+                )
+            else:
+                print(f"[i] memory_mode={mode}")
         else:
             assert K <= 1, (
                 f"--memory-window ({K}) given but checkpoint is vanilla "

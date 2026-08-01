@@ -186,6 +186,23 @@ class FinetuneConfig:
     - "adaln": the pooled memory vector goes through a zero-init Linear and is added to
       the DiT timestep embedding; the moment-token tail is sliced off the KV."""
 
+    memory_mode: Literal["window", "zoo"] = "window"
+    """How the memory window is populated.
+    "window" (original HAMLET): each batch row loads K=memory_window observations at
+    once (video delta_indices = [-(K-1)S, ..., -S, 0]) and the whole window is
+    differentiable.
+    "zoo": each batch row loads a SINGLE observation (delta_indices = [0]); the window is
+    assembled across iterations from a per-episode cache of the most "transitional"
+    past observations, selected by the L1 distance between consecutive moment->image
+    attention maps. Requires sequential_anchors=True and anchor_stride == memory_stride
+    so consecutive iterations of an episode really are memory_stride apart; both are
+    forced in launch_finetune.py. Cached blocks are detached (they come from previous
+    iterations), so gradient reaches the backbone only through the current observation."""
+
+    zoo_max_episodes: int = 4096
+    """Cap on how many episodes the zoo pool keeps; least-recently-seen entries are
+    evicted. Each entry holds (memory_window-1) x n_moment_tokens x d activations."""
+
     memory_type: Literal["moment_token", "vision_feature"] = "moment_token"
     """What flows through the memory module (action-head VLM conditioning is unchanged).
     "moment_token": learnable moment tokens' post-LLM hidden states.

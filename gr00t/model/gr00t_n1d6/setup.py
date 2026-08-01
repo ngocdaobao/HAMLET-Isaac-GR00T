@@ -84,6 +84,8 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                 mem_cond_type=self.config.model.mem_cond_type,
                 freeze_moment_tokens=self.config.model.freeze_moment_tokens,
                 memory_type=self.config.model.memory_type,
+                memory_mode=self.config.model.memory_mode,
+                zoo_max_episodes=self.config.model.zoo_max_episodes,
                 tcl_tau=self.config.model.tcl_tau,
                 # Persist the key-moment gate settings onto the model config so they
                 # land in the saved config.json (eval then inherits them). Without

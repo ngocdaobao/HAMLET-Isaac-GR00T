@@ -180,4 +180,3 @@ upload_ckpt.py
 
 # Run
 /wandb
-/run_scripts
