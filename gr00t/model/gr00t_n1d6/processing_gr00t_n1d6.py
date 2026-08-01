@@ -248,8 +248,8 @@ class Gr00tN1d6DataCollator:
 
     def __call__(self, features: list[Dict[str, Any]]) -> BatchFeature:
         batch = {}
-        # if self._viz_dir:
-        #     self._dump_batch_images(features)
+        if self._viz_dir:
+            self._dump_batch_images(features)
         # `_viz_*` provenance keys are kept for the key-moment gate: the episode index
         # keys the model's state cache, the step index detects episode restarts.
         keys = list(set().union(*(elem.keys() for elem in features)))
