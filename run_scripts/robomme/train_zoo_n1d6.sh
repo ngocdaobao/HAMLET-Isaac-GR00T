@@ -37,8 +37,8 @@ BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.6-3B}"
 NUM_GPUS="${NUM_GPUS:-4}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"                  # zoo forwards 1 obs/row regardless of K, so this need not scale with K
-MAX_STEPS="${MAX_STEPS:-200}"
-SAVE_STEPS="${SAVE_STEPS:-200}"
+MAX_STEPS="${MAX_STEPS:-60000}"
+SAVE_STEPS="${SAVE_STEPS:-60000}"
 MASTER_PORT="${MASTER_PORT:-$(( 20000 + RANDOM % 10000 ))}"
 
 # HAMLET memory options

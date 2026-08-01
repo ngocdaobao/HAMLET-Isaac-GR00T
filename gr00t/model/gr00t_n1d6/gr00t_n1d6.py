@@ -332,13 +332,13 @@ class Gr00tN1d6ActionHead(nn.Module):
                     pool["step_ids"][lo] = self._zoo_tick if step is None else step
                     add_to_pool = True
             
-            viz_dir = "runs/robomme/attn_logs"
-            os.makedirs(viz_dir, exist_ok=True)
+            # viz_dir = "runs/robomme/attn_logs"
+            # os.makedirs(viz_dir, exist_ok=True)
 
-            viz_file = os.path.join(viz_dir, f"ep_{key}.txt")
+            # viz_file = os.path.join(viz_dir, f"ep_{key}.txt")
 
-            with open(viz_file, "a") as f:
-                f.write(f"Step {step}: Trans_score {trans_score}, Added to pool: {add_to_pool}\n")
+            # with open(viz_file, "a") as f:
+            #     f.write(f"Step {step}: Trans_score {trans_score}, Added to pool: {add_to_pool}\n")
 
             # Oldest-first ordering: replacement scrambles insertion order, but the
             # memory transformer's block-RoPE encodes temporal position, so the blocks
