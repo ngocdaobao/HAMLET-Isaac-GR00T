@@ -311,23 +311,34 @@ class Gr00tN1d6ActionHead(nn.Module):
                 # so the episode's first frame stays pinned as a start-of-episode anchor
                 # and only K_target-2 pool slots actually rotate. Set this to 0.0 instead
                 # if you would rather have all K_target-1 slots compete.
-                trans_score = float("inf")
+                trans_score = 0.0
             else:
                 trans_score = (a - pool["prev_attn"]).abs().mean().item()
             pool["prev_attn"] = a  # "most recent obs" must advance every step
             pool["last_step"] = step
 
             tok = current[idx].detach()
+            add_to_pool = False
             if len(pool["tokens"]) < K_target - 1:
                 pool["tokens"].append(tok)
                 pool["scores"].append(trans_score)
                 pool["step_ids"].append(self._zoo_tick if step is None else step)
+                add_to_pool = True
             else:
                 lo = min(range(len(pool["scores"])), key=pool["scores"].__getitem__)
                 if trans_score > pool["scores"][lo]:
                     pool["tokens"][lo] = tok
                     pool["scores"][lo] = trans_score
                     pool["step_ids"][lo] = self._zoo_tick if step is None else step
+                    add_to_pool = True
+            
+            viz_dir = f'runs/robomme/attn_logs/ep_{key}.txt'
+            if not os.path.exists(viz_dir):
+                os.makedirs(viz_dir)
+            
+            # Append to .txt file
+            with open(viz_dir, 'a') as f:
+                f.write(f"Step {step}: Trans_score {trans_score}, Added to pool: {add_to_pool}\n")
 
             # Oldest-first ordering: replacement scrambles insertion order, but the
             # memory transformer's block-RoPE encodes temporal position, so the blocks
