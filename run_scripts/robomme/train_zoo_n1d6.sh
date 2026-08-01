@@ -46,7 +46,7 @@ MEMORY_MODE="${MEMORY_MODE:-zoo}"             # zoo | window  (see header)
 # Memory-transformer sequence length T = pool target. The pool holds K-1 PAST
 # observations plus the current one. K=1 leaves no room for history at all, so zoo
 # needs K>=2; K=4 matches the HAMLET default window.
-K="${K:-4}"                                   # memory window = history length
+K="${K:-10}"                                   # memory window = history length
 ZOO_MAX_EPISODES="${ZOO_MAX_EPISODES:-4096}"  # LRU cap on how many episodes keep a pool
 MEMORY_STRIDE="${MEMORY_STRIDE:-16}"          # env steps between snapshots; set equal to the eval n_action_steps
 N_MOMENT_TOKENS="${N_MOMENT_TOKENS:-4}"       # moment tokens per step (n_q)
