@@ -394,7 +394,7 @@ def main(cfg: Config) -> None:
     env_builder = BenchmarkEnvBuilder(
         env_id=cfg.task_id,
         dataset=cfg.dataset,
-        action_space="joint_angle",
+        action_space="joint_angle", 
         gui_render=False,
         max_steps=cfg.max_episode_steps,
     )

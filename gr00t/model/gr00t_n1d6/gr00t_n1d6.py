@@ -20,6 +20,10 @@ import tree
 from PIL import Image
 
 import logging
+
+# Set GR00T_MEM_DEBUG=1 to print one line per policy call for the zoo pool and one for
+# the key-moment gate. Meant for eval rollouts; leave unset during training.
+_MEM_DEBUG = bool(os.environ.get("GR00T_MEM_DEBUG"))
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
@@ -351,6 +355,18 @@ class Gr00tN1d6ActionHead(nn.Module):
                 oldest = past[0] if past else current[idx].detach()
                 past = [oldest] * (K_target - 1 - len(past)) + past
             mem_seq.append(torch.stack(past + [current[idx]], dim=0))  # (K_target, n_q, d)
+
+            if _MEM_DEBUG:
+                # Left-padding repeats the SAME tensor object, so counting distinct ids
+                # tells us how many of the K blocks are real history. uniq==1 means the
+                # pool is being reset every call and memory carries nothing.
+                uniq = len({id(t) for t in past} | {id(current[idx])})
+                print(
+                    f"[mem] pool ep={key} restart={restart} trans={trans_score:.5f} "
+                    f"added={add_to_pool} pool={len(pool['tokens'])}/{K_target - 1} "
+                    f"uniq_blocks={uniq}/{K_target}",
+                    flush=True,
+                )
 
         self._evict_zoo_pool()
         backbone_output["mem_seq"] = torch.stack(mem_seq, dim=0).view(B, K_target * n_q, d)
@@ -1192,6 +1208,20 @@ class Gr00tN1d6(PreTrainedModel):
                     mask_key_moment[idx] = self.compute_window_delta([prev[0], states[idx]])
                     # cur_delta= self.delta([prev[0], states[idx]])
                     # write_delta(key, steps[idx], cur_delta)
+                if _MEM_DEBUG:
+                    # prev=None means the gate could not pair (first call, or the state
+                    # cache was just cleared) -> mask stays 0 and memory is zeroed.
+                    d = (
+                        float(self.delta([prev[0], states[idx]]))
+                        if prev is not None
+                        else float("nan")
+                    )
+                    print(
+                        f"[mem] gate ep={key} reset={None if reset_state is None else bool(list(reset_state)[idx])} "
+                        f"paired={prev is not None} delta={d:.4f} "
+                        f"thr={self.delta_threshold} mask={mask_key_moment[idx]}",
+                        flush=True,
+                    )
                 self.state_cache[key] = (states[idx], steps[idx])
                 # Cache delta for visualization (debugging / analysis). The cache is keyed by episode index
 
