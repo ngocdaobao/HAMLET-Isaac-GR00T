@@ -108,6 +108,14 @@ class Gr00tPolicy(BasePolicy):
         # forever on a long-running server. Cap the number of live sessions.
         self._session_lru: list[str] = []
         self._session_cache_cap: int = 64
+        # Session identity, tracked independently of the FIFO caches above.
+        # memory_mode="zoo" keeps its history in `action_head.memory_pool` and never
+        # writes `_memory_cache`/`_vision_cache`, so deriving "have we seen this
+        # session?" from those dicts would report a reset on *every* call — which
+        # clears the zoo pool and the key-moment state cache each step, leaving the
+        # memory window filled with copies of the current frame and mask_key_moment
+        # pinned at 0 for the whole rollout.
+        self._seen_sessions: set[str] = set()
         if self.use_hamlet_inference:
             if "video" in self.modality_configs:
                 self.modality_configs["video"].delta_indices = [0]
@@ -322,7 +330,7 @@ class Gr00tPolicy(BasePolicy):
                     f"Language batch item must be a string. Got {type(batch_item[0])}"
                 )
 
-    def _get_action(
+    def _get_action( 
         self, observation: dict[str, Any], options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Internal method to compute actions from observations.
@@ -373,10 +381,6 @@ class Gr00tPolicy(BasePolicy):
             if reset_memory_flags is None: 
                 reset_memory_flags = [False] * B
 
-            is_vision = (
-                getattr(self.model.action_head, "memory_type", "moment_token")
-                == "vision_feature"
-            )
             cached = [
                 None if reset_memory_flags[i] else self._memory_cache.get(session_ids[i])
                 for i in range(B)
@@ -403,11 +407,12 @@ class Gr00tPolicy(BasePolicy):
                 self.model.action_head._vision_cache = stacked_vis.to(self.model.device)
             else:
                 self.model.action_head._vision_cache = None
-            # A sample resets when explicitly asked OR when the cache relevant to
-            # this model variant has no per-session state yet.
-            relevant = cached_vis if is_vision else cached
+            # A sample resets when explicitly asked OR on the first call of a session.
+            # Deliberately keyed off `_seen_sessions` rather than the FIFO caches: those
+            # stay empty for memory_mode="zoo", which would turn every call into a reset.
             effective_reset = [
-                bool(reset_memory_flags[i] or relevant[i] is None) for i in range(B)
+                bool(reset_memory_flags[i] or session_ids[i] not in self._seen_sessions)
+                for i in range(B)
             ]
             reset_tensor = torch.tensor(effective_reset, dtype=torch.bool, device=self.model.device)
             # session_ids key the model's key-moment state cache (window-end deltas)
@@ -437,6 +442,9 @@ class Gr00tPolicy(BasePolicy):
             self.model.action_head._memory_cache = None
             self.model.action_head._vision_cache = None
             # Touch LRU order and evict sessions beyond the cap (oldest first).
+            # `_seen_sessions` tracks the same set, so it is updated in lockstep —
+            # an evicted session must look brand new again on its next call.
+            self._seen_sessions.update(session_ids)
             for sid in session_ids:
                 if sid in self._session_lru:
                     self._session_lru.remove(sid)
@@ -445,6 +453,7 @@ class Gr00tPolicy(BasePolicy):
                 stale = self._session_lru.pop(0)
                 self._memory_cache.pop(stale, None)
                 self._vision_session_cache.pop(stale, None)
+                self._seen_sessions.discard(stale)
 
         normalized_action = model_pred["action_pred"].float()
 

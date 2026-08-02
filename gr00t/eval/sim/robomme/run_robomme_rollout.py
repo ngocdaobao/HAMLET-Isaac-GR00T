@@ -98,16 +98,35 @@ def _build_step_obs(env_obs, idx: int, task_goal: str) -> dict:
     }
 
 
-def _prime_hamlet_memory(policy, env_obs, session_id, task_goal, K: int, stride: int) -> None:
-    """Prime the HAMLET memory cache with K-1 strided demo frames so that, after the
-    first execution-phase policy call, the cache matches the training memory window
-    [t-(K-1)S, t-(K-2)S, ..., t-S, t] at anchor t = first non-demo frame.
+def _prime_hamlet_memory(policy, env_obs, session_id, task_goal, K: int, stride: int,
+                        memory_mode: str = "window") -> None:
+    """Feed the demo (watch) phase through the policy at the trained stride S, so that
+    the first execution-phase call sees the memory state training would have produced
+    at anchor t = first non-demo frame.
 
-    Trace (K=4, S=16, anchor=n_demo):
-      prime 1 (F1 = obs[n_demo - 3S], reset_memory=True)  -> cache = [F1]*K
-      prime 2 (F2 = obs[n_demo - 2S], reset_memory=False) -> cache = [F1, F1, F1, F2]
-      prime 3 (F3 = obs[n_demo -  S], reset_memory=False) -> cache = [F1, F1, F2, F3]
-      exec  1 (E1 = obs[n_demo]    , reset_memory=False) -> cache = [F1, F2, F3, E1]
+    How many demo frames get replayed depends on how the checkpoint fills its window:
+
+    memory_mode="window" — the model keeps a FIFO of the last K snapshots, so only the
+    last K-1 primes can survive. Replaying more would be pure wasted compute.
+      Trace (K=4, S=16, anchor=n_demo):
+        prime 1 (F1 = obs[n_demo - 3S], reset_memory=True)  -> cache = [F1]*K
+        prime 2 (F2 = obs[n_demo - 2S], reset_memory=False) -> cache = [F1, F1, F1, F2]
+        prime 3 (F3 = obs[n_demo -  S], reset_memory=False) -> cache = [F1, F1, F2, F3]
+        exec  1 (E1 = obs[n_demo]    , reset_memory=False) -> cache = [F1, F2, F3, E1]
+
+    memory_mode="zoo" — the window is NOT the last K-1 observations; it is the K-1
+    most transitional ones, chosen by attention-map movement as the episode streams
+    past (`GR00T_N1d6ActionHead.process_mem_cache`). In training the pool sees every
+    anchor of the episode from step 0 and rotates its slots; replaying only the last
+    K-1 demo frames would hand it a pool that is never full, so no selection happens
+    at all and anything earlier than n_demo-(K-1)S is invisible. Replay the WHOLE demo
+    phase instead — same candidate stream, same stride, same selection as training.
+
+    Indices are anchored so the last prime sits exactly one stride before the first
+    execution frame, and indices before the start of the demo are DROPPED rather than
+    clamped: clamping would feed one frame repeatedly at a spacing never seen in
+    training, whereas a short window is already padded by repeating the oldest entry
+    in both memory paths — exactly what training does at the start of an episode.
 
     Vanilla (no HAMLET) policies ignore reset_memory/session_ids -> effective no-op.
 
@@ -118,9 +137,23 @@ def _prime_hamlet_memory(policy, env_obs, session_id, task_goal, K: int, stride:
     if n_total <= 1 or K <= 1:
         return
     n_demo = n_total - 1  # last entry is the current frame, rest are demo
-    # K-1 prime indices at stride S, clamped to valid demo range.
-    prime_indices = [max(0, min(n_demo - (K - 1 - i) * stride, n_demo - 1)) for i in range(K - 1)]
-    print(f"[i] HAMLET prime: n_demo={n_demo}, K={K}, S={stride}, indices={prime_indices}")
+    # Stride-S grid ending at n_demo - S, walking back to the start of the demo.
+    n_slots = (n_demo // stride) if memory_mode == "zoo" else (K - 1)
+    prime_indices = [
+        idx
+        for idx in (n_demo - (n_slots - i) * stride for i in range(n_slots))
+        if 0 <= idx < n_demo
+    ]
+    print(
+        f"[i] HAMLET prime: n_demo={n_demo}, K={K}, S={stride}, mode={memory_mode}, "
+        f"{len(prime_indices)} frames, indices={prime_indices}"
+    )
+    if memory_mode != "zoo" and len(prime_indices) < K - 1:
+        print(
+            f"[warn] demo phase ({n_demo} frames) is shorter than the full memory window "
+            f"((K-1)*S = {(K - 1) * stride}); priming {len(prime_indices)}/{K - 1} slots "
+            f"and letting the model pad the rest."
+        )
     for i, idx in enumerate(prime_indices):
         step_obs = _build_step_obs(env_obs, idx, task_goal)
         # prime_only: cache update without flow-matching denoising, so the seeded
@@ -232,9 +265,9 @@ class Config:
     memory_window adaptively when --memory-window 0 (auto)."""
 
 
-def _resolve_memory_params(cfg: Config) -> tuple[int, int]:
-    """Resolve the priming window K and memory stride S from the checkpoint's
-    config.json, hard-failing on any detectable train/inference mismatch.
+def _resolve_memory_params(cfg: Config) -> tuple[int, int, str]:
+    """Resolve the priming window K, memory stride S and memory mode from the
+    checkpoint's config.json, hard-failing on any detectable train/inference mismatch.
 
     - The rolling memory cache advances once per policy call, so
       n_action_steps MUST equal the trained memory_stride.
@@ -255,7 +288,8 @@ def _resolve_memory_params(cfg: Config) -> tuple[int, int]:
 
     K = cfg.memory_window
     stride = cfg.memory_stride
- 
+    mode = "window"
+
     if mc is not None:
         if mc.get("hamlet_mode") == "finetune":
             trained_K = int(mc.get("memory_window", MEMORY_WINDOW))
@@ -284,13 +318,16 @@ def _resolve_memory_params(cfg: Config) -> tuple[int, int]:
             if mode == "zoo":
                 # zoo assembles its window across policy CALLS from a per-episode pool,
                 # keyed by session id and reset via reset_memory -- the same call cadence
-                # the priming loop below already uses, so priming needs no change. The
-                # n_action_steps == memory_stride check above is what keeps the
-                # inter-call spacing equal to the trained one.
+                # the priming loop below already uses. The n_action_steps == memory_stride
+                # check above is what keeps the inter-call spacing equal to the trained
+                # one. Because the pool SELECTS its K-1 slots by attention movement over
+                # the whole episode, priming must replay the whole demo phase, not just
+                # the last K-1 frames (see _prime_hamlet_memory).
                 print(
                     f"[i] memory_mode=zoo: window assembled across calls from the "
-                    f"attention-selected pool (K_target={K}); priming supplies the first "
-                    f"{max(0, K - 1)} observations."
+                    f"attention-selected pool (K_target={K}); priming replays the whole "
+                    f"demo phase at stride S so the pool sees the same candidate stream "
+                    f"as training."
                 )
             else:
                 print(f"[i] memory_mode={mode}")
@@ -301,7 +338,7 @@ def _resolve_memory_params(cfg: Config) -> tuple[int, int]:
             )
             K = 1  # vanilla policy -> skip priming entirely
         print(f"[i] memory_window K={K}, stride S={stride} (source: {cfg_path})")
-        return K, stride
+        return K, stride, mode
 
     # No readable model config: fall back to CLI/defaults (cannot verify).
     if K <= 0:
@@ -310,13 +347,13 @@ def _resolve_memory_params(cfg: Config) -> tuple[int, int]:
     else:
         print(f"[i] memory_window K={K} (explicit CLI; no model config to verify)")
     print(f"[i] memory stride S={stride} (unverified)")
-    return K, stride
+    return K, stride, mode
 
 
 def main(cfg: Config) -> None:
     from gr00t.policy.server_client import PolicyClient  # type: ignore
 
-    memory_window, memory_stride = _resolve_memory_params(cfg)
+    memory_window, memory_stride, memory_mode = _resolve_memory_params(cfg)
 
     out_dir = Path(cfg.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -375,7 +412,8 @@ def main(cfg: Config) -> None:
         task_goal = info["task_goal"][0]
         print(f"[i] ep={ep} task_goal='{task_goal[:80]}...' demo_frames={len(env_obs['front_rgb_list']) - 1}")
 
-        _prime_hamlet_memory(policy, env_obs, session_id, task_goal, memory_window, memory_stride)
+        _prime_hamlet_memory(policy, env_obs, session_id, task_goal, memory_window,
+                             memory_stride, memory_mode)
 
         # Prepend the demo (watch) phase to the saved video so failure analysis can see
         # what the policy was asked to replicate. Demo frames get a red border to mark
