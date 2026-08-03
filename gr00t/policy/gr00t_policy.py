@@ -5,6 +5,7 @@ This module provides the core policy classes for running Gr00t models:
 - Gr00tSimPolicyWrapper: Wrapper for compatibility with existing Gr00t simulation environments
 """
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,10 @@ from gr00t.data.interfaces import BaseProcessor
 from gr00t.data.types import MessageType, ModalityConfig, VLAStepData
 
 from .policy import BasePolicy, PolicyWrapper
+
+# Matches GR00T_MEM_DEBUG in gr00t/model/gr00t_n1d6/gr00t_n1d6.py: when set, hand the
+# raw frames to the action head so it can dump the observations it caches.
+_MEM_DEBUG = bool(os.environ.get("GR00T_MEM_DEBUG"))
 
 
 def _rec_to_dtype(x: Any, dtype: torch.dtype) -> Any:
@@ -378,8 +383,20 @@ class Gr00tPolicy(BasePolicy):
                 reset_memory_flags = options.get("reset_memory")
             if session_ids is None:
                 session_ids = [f"default_{i}" for i in range(B)]
-            if reset_memory_flags is None: 
+            if reset_memory_flags is None:
                 reset_memory_flags = [False] * B
+
+            if _MEM_DEBUG:
+                # Raw uint8 frames, all views side by side, one entry per batch row.
+                # The zoo pool holds moment tokens, so it cannot recover pixels on its
+                # own; it dumps from here whenever an observation is admitted.
+                views = [
+                    observation["video"][k]
+                    for k in self.modality_configs["video"].modality_keys
+                ]
+                self.model.action_head._debug_images = [
+                    np.hstack([v[i, 0] for v in views]) for i in range(B)
+                ]
 
             cached = [
                 None if reset_memory_flags[i] else self._memory_cache.get(session_ids[i])

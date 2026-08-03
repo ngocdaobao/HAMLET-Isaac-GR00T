@@ -159,6 +159,7 @@ def _prime_hamlet_memory(policy, env_obs, session_id, task_goal, K: int, stride:
         # prime_only: cache update without flow-matching denoising, so the seeded
         # action-noise RNG stays call-aligned with non-primed (vanilla) policies.
         options = {"session_ids": [session_id], "reset_memory": [i == 0], "prime_only": True}
+        # Get action to feed through model, DO NOT execute !
         try:
             policy.get_action(step_obs, options=options)
         except Exception as exc:

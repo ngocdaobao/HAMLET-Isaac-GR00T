@@ -24,6 +24,46 @@ import logging
 # Set GR00T_MEM_DEBUG=1 to print one line per policy call for the zoo pool and one for
 # the key-moment gate. Meant for eval rollouts; leave unset during training.
 _MEM_DEBUG = bool(os.environ.get("GR00T_MEM_DEBUG"))
+_MEM_DEBUG_DIR = os.environ.get("GR00T_MEM_DEBUG_DIR", "runs/eval/mem_cache_obs")
+
+
+def _cached_obs_path(episode, step_id):
+    """Path of the frame backing one pool entry, keyed by the id stored in
+    `pool["step_ids"]` so files and pool slots stay 1:1."""
+    return os.path.join(_MEM_DEBUG_DIR, f"ep{episode}", f"step{step_id:06d}.png")
+
+
+def _save_cached_obs(episode, step_id, images, idx):
+    """Save the observation whose moment tokens were just admitted to the zoo pool.
+
+    The pool stores post-LLM moment tokens, not pixels, so the frames are handed over
+    by Gr00tPolicy (see `_debug_images`) purely for this dump. Paired with
+    `_drop_cached_obs`/`_clear_cached_obs`, the episode directory always holds exactly
+    the observations whose tokens are currently cached.
+    """
+    if images is None or idx >= len(images):
+        return
+    path = _cached_obs_path(episode, step_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    Image.fromarray(images[idx]).save(path)
+
+
+def _drop_cached_obs(episode, step_id):
+    """Delete the frame for a pool entry that is being displaced."""
+    path = _cached_obs_path(episode, step_id)
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def _clear_cached_obs(episode):
+    """Drop every frame for an episode whose pool just restarted, so a fresh rollout
+    never inherits frames from the previous one (or from an earlier eval run)."""
+    out_dir = os.path.join(_MEM_DEBUG_DIR, f"ep{episode}")
+    if not os.path.isdir(out_dir):
+        return
+    for name in os.listdir(out_dir):
+        if name.endswith(".png"):
+            os.remove(os.path.join(out_dir, name))
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
@@ -305,6 +345,8 @@ class Gr00tN1d6ActionHead(nn.Module):
                 pool = {"tokens": [], "scores": [], "step_ids": [], "prev_attn": None,
                         "last_step": None}
                 self.memory_pool[key] = pool
+                if _MEM_DEBUG:
+                    _clear_cached_obs(key)
             pool["last_seen"] = self._zoo_tick
 
             a = attn_score[idx]
@@ -331,11 +373,22 @@ class Gr00tN1d6ActionHead(nn.Module):
             else:
                 lo = min(range(len(pool["scores"])), key=pool["scores"].__getitem__)
                 if trans_score > pool["scores"][lo]:
+                    if _MEM_DEBUG:
+                        # Read the outgoing id before it is overwritten below.
+                        _drop_cached_obs(key, pool["step_ids"][lo])
                     pool["tokens"][lo] = tok
                     pool["scores"][lo] = trans_score
                     pool["step_ids"][lo] = self._zoo_tick if step is None else step
                     add_to_pool = True
-            
+
+            if _MEM_DEBUG and add_to_pool:
+                _save_cached_obs(
+                    key,
+                    self._zoo_tick if step is None else step,
+                    getattr(self, "_debug_images", None),
+                    idx,
+                )
+
             # viz_dir = "runs/robomme/attn_logs"
             # os.makedirs(viz_dir, exist_ok=True)
 
@@ -1003,7 +1056,7 @@ class Gr00tN1d6ActionHead(nn.Module):
             embodiment_id=action_input.embodiment_id,
             backbone_output=backbone_output,
         )
-
+ 
     @property
     def device(self):
         return next(iter(self.parameters())).device
