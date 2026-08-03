@@ -357,7 +357,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                 # so the episode's first frame stays pinned as a start-of-episode anchor
                 # and only K_target-2 pool slots actually rotate. Set this to 0.0 instead
                 # if you would rather have all K_target-1 slots compete.
-                trans_score = 0.0
+                trans_score = float("inf")
             else:
                 trans_score = (a - pool["prev_attn"]).abs().mean().item()
             pool["prev_attn"] = a  # "most recent obs" must advance every step
@@ -371,16 +371,22 @@ class Gr00tN1d6ActionHead(nn.Module):
                 pool["step_ids"].append(self._zoo_tick if step is None else step)
                 add_to_pool = True
             else:
+                # Always cache the current obs
+                # Drop the lowest scoring block to make room for the new one. This is a simple heuristic; more
                 lo = min(range(len(pool["scores"])), key=pool["scores"].__getitem__)
-                if trans_score > pool["scores"][lo]:
-                    if _MEM_DEBUG:
-                        # Read the outgoing id before it is overwritten below.
-                        _drop_cached_obs(key, pool["step_ids"][lo])
-                    pool["tokens"][lo] = tok
-                    pool["scores"][lo] = trans_score
-                    pool["step_ids"][lo] = self._zoo_tick if step is None else step
-                    add_to_pool = True
-
+                # if trans_score > pool["scores"][lo]:
+                #     if _MEM_DEBUG:
+                #         # Read the outgoing id before it is overwritten below.
+                #         _drop_cached_obs(key, pool["step_ids"][lo])
+                #     pool["tokens"][lo] = tok
+                #     pool["scores"][lo] = trans_score
+                #     pool["step_ids"][lo] = self._zoo_tick if step is None else step
+                #     add_to_pool = True
+                pool["tokens"][lo] = tok
+                pool["scores"][lo] = trans_score
+                pool["step_ids"][lo] = self._zoo_tick if step is None else step
+                add_to_pool = True
+                
             if _MEM_DEBUG and add_to_pool:
                 _save_cached_obs(
                     key,
