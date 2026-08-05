@@ -129,6 +129,13 @@ class Gr00tN1d6Config(PretrainedConfig):
     # Persisted to the checkpoint config so evaluation inherits the same behavior.
     memory_mode: str = "window"
     zoo_max_episodes: int = 4096
+    # Zoo pool selection. score = (1-w)*rank(attn) - w*softmax(log local_density);
+    # the lowest-scoring block is evicted. See Gr00tN1d6ActionHead.pool_scores.
+    zoo_density_weight: float = 0.5  # w: 0 = attention only, 1 = density only
+    zoo_step_tau: float = 0.15  # how far in time a neighbour still counts
+    zoo_dist_tau: float = 0.5  # how close in appearance counts as redundant
+    zoo_density_k: int = 4  # kNN neighbourhood size for the density estimate
+    zoo_density_temp: float = 2.0  # softmax temperature normalizing density over the pool
     # Key-moment gate: when True, memory is zeroed out on non-key-moment steps
     # (window-end joint-state delta >= delta_threshold). When False, memory is
     # never gated -> plain HAMLET. Persisted to the checkpoint config so eval

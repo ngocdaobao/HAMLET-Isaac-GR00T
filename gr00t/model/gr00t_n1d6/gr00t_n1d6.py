@@ -23,8 +23,9 @@ import logging
 
 # Set GR00T_MEM_DEBUG=1 to print one line per policy call for the zoo pool and one for
 # the key-moment gate. Meant for eval rollouts; leave unset during training.
-_MEM_DEBUG = bool(os.environ.get("GR00T_MEM_DEBUG"))
-_MEM_DEBUG_DIR = os.environ.get("GR00T_MEM_DEBUG_DIR", "runs/eval/mem_cache_obs")
+# _MEM_DEBUG = bool(os.environ.get("GR00T_MEM_DEBUG"))
+_MEM_DEBUG = True
+_MEM_DEBUG_DIR = os.environ.get("GR00T_MEM_DEBUG_DIR", "runs/mem_cache_obs")
 
 
 def _cached_obs_path(episode, step_id):
@@ -64,6 +65,19 @@ def _clear_cached_obs(episode):
     for name in os.listdir(out_dir):
         if name.endswith(".png"):
             os.remove(os.path.join(out_dir, name))
+def _rank01(v):
+    """Replace each value by its position in the sorted order, scaled to [0,1].
+
+    `argsort` says which element belongs in position p; scattering `arange` through it
+    inverts that permutation into "which position does element i land in". Depends only
+    on ordering, so it is immune to scale drift as backbone features change -- which is
+    what keeps a weight tuned against it meaningful later in training.
+    """
+    r = torch.empty_like(v)
+    r[v.argsort()] = torch.arange(v.numel(), device=v.device, dtype=v.dtype)
+    return r / max(v.numel() - 1, 1)
+
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
@@ -275,6 +289,70 @@ class Gr00tN1d6ActionHead(nn.Module):
         sample = (1 - sample) * self.config.noise_s
         return sample
 
+    @torch.no_grad()
+    def local_density(self, tokens, step_ids, tau, tau_d, k: int):
+        """
+            Compute the local density of each token in pool memory,
+            based on how close its k nearest neighbors are. High density means the
+            token sits in a crowded region -- the pool already covers what it shows.
+
+            Similarity is the base criterion and the step gap weights it: a neighbor
+            far in TIME has its distance inflated, so it counts as less redundant.
+            Density therefore ranks
+                similar + close in step > similar + far
+                                        > dissimilar + close > dissimilar + far.
+        """
+        pool_matrix = torch.stack(tokens, dim=0).flatten(start_dim=1).float()  # (M, n_q*d)
+        pool_matrix = F.normalize(pool_matrix, dim=1)
+        M = pool_matrix.shape[0]
+        step_matrix = torch.tensor(
+            step_ids, device=pool_matrix.device, dtype=torch.float32
+        ).unsqueeze(1)  # (M, 1)
+
+        step_space = torch.abs(step_matrix - step_matrix.T)  # (M, M)
+        step_space = step_space / (step_matrix.max() - step_matrix.min()).clamp(min=1.0)
+
+        distances = torch.cdist(pool_matrix, pool_matrix, p=2)  # (M, M)
+
+        distances.fill_diagonal_(float("inf"))
+        k = min(k, M - 1)
+        knn_distances, ids = torch.topk(distances, k=k, largest=False)  # (M, k)
+
+        step_space_knn = step_space.gather(1, ids)  # (M, k)
+        step_weight = 1.0 + step_space_knn / tau  # (M, k) in [1, 1 + 1/tau]
+        sigma = torch.exp(-(step_weight * knn_distances).mean(dim=1) / tau_d)  # (M,)
+
+        return sigma  # (M,) in (0, 1]
+
+    @torch.no_grad()
+    def pool_scores(self, tokens, step_ids, attn):
+        """Rank pooled blocks for eviction; the argmin is the block to drop.
+
+        A block worth keeping is (a) relevant to the language instruction -- high
+        text->image attention -- and (b) not redundant with what the pool already
+        covers -- low local density. The two are on incomparable scales (attention is
+        a narrow band near 1/n_img; density is a decaying kernel over (0,1]), so each
+        is mapped to [0,1] before mixing. Skip that and the raw spreads decide the
+        balance instead of `w`, which is what makes the weight meaningless.
+        """
+        w = getattr(self.config, "zoo_density_weight", 0.5)
+        tau = getattr(self.config, "zoo_step_tau", 0.15)
+        tau_d = getattr(self.config, "zoo_dist_tau", 0.5)
+        k = getattr(self.config, "zoo_density_k", 4)
+        temp = getattr(self.config, "zoo_density_temp", 2.0)
+
+        sigma = self.local_density(tokens, step_ids, tau=tau, tau_d=tau_d, k=k)
+        dens = torch.softmax(torch.log(sigma + 1e-6) / temp, dim=0)
+        dens = dens / dens.max().clamp(min=1e-12)  # (M,) in (0, 1]
+
+        a = torch.stack(attn).float().view(-1)  # (M,)
+        if (a.max() - a.min()) <= 1e-9:
+            rel = torch.zeros_like(a)
+        else:
+            rel = _rank01(a)
+
+        return (1.0 - w) * rel - w * dens
+
     def process_mem_cache(
         self,
         backbone_output: BatchFeature,
@@ -283,23 +361,7 @@ class Gr00tN1d6ActionHead(nn.Module):
         action_inputs_B: int | None = None,
         reset_memory: torch.Tensor | None = None,
     ) -> BatchFeature:
-        """zoo memory selection.
 
-        One observation per iteration (K == 1). Each episode keeps a pool of at most
-        K_target-1 PAST moment-token sets, admitted by how much the observation's
-        attention map moved relative to the previous observation of that episode
-        (`trans_score`). A new observation displaces the pooled entry with the lowest
-        trans_score once the pool is full.
-
-        Writes `backbone_output["mem_seq"]` of shape (B, K_target*n_q, d), oldest block
-        first, with the CURRENT step's (gradient-carrying) tokens as the last block --
-        that is the ordering `MemoryTransformer` assumes.
-
-        Pooled entries are detached: they were produced by earlier iterations whose graph
-        is long freed, so keeping them live would either error out on the second backward
-        or silently retain the whole backbone graph. Gradient still reaches the backbone
-        through the current block.
-        """
         n_q = int(backbone_output["n_moment_tokens"])
         K_target = self.memory_transformer.T
         # vlln is applied ONCE, here, and process_backbone_output_zoo must not repeat it.
@@ -342,66 +404,62 @@ class Gr00tN1d6ActionHead(nn.Module):
                 or (step is not None and pool["last_step"] is not None and step <= pool["last_step"])
             )
             if restart:
-                pool = {"tokens": [], "scores": [], "step_ids": [], "prev_attn": None,
-                        "last_step": None}
+                pool = {"tokens": [], "step_ids": [], "attn": [],
+                        "staged": None, "last_step": None}
                 self.memory_pool[key] = pool
                 if _MEM_DEBUG:
                     _clear_cached_obs(key)
             pool["last_seen"] = self._zoo_tick
 
             a = attn_score[idx]
-            if pool["prev_attn"] is None:
-                # First observation of the episode: no predecessor to compare against, so
-                # admit it unconditionally rather than scoring it on a different scale
-                # than every later candidate. Consequence: score=inf never wins the argmin,
-                # so the episode's first frame stays pinned as a start-of-episode anchor
-                # and only K_target-2 pool slots actually rotate. Set this to 0.0 instead
-                # if you would rather have all K_target-1 slots compete.
-                trans_score = float("inf")
-            else:
-                trans_score = (a - pool["prev_attn"]).abs().mean().item()
-            pool["prev_attn"] = a  # "most recent obs" must advance every step
             pool["last_step"] = step
+            step_id = self._zoo_tick if step is None else step
+            cap = K_target
+            admitted = None
 
-            tok = current[idx].detach()
-            add_to_pool = False
-            if len(pool["tokens"]) < K_target - 1:
-                pool["tokens"].append(tok)
-                pool["scores"].append(trans_score)
-                pool["step_ids"].append(self._zoo_tick if step is None else step)
-                add_to_pool = True
-            else:
-                # Always cache the current obs
-                # Drop the lowest scoring block to make room for the new one. This is a simple heuristic; more
-                lo = min(range(len(pool["scores"])), key=pool["scores"].__getitem__)
-                # if trans_score > pool["scores"][lo]:
-                #     if _MEM_DEBUG:
-                #         # Read the outgoing id before it is overwritten below.
-                #         _drop_cached_obs(key, pool["step_ids"][lo])
-                #     pool["tokens"][lo] = tok
-                #     pool["scores"][lo] = trans_score
-                #     pool["step_ids"][lo] = self._zoo_tick if step is None else step
-                #     add_to_pool = True
-                pool["tokens"][lo] = tok
-                pool["scores"][lo] = trans_score
-                pool["step_ids"][lo] = self._zoo_tick if step is None else step
-                add_to_pool = True
-                
-            if _MEM_DEBUG and add_to_pool:
-                _save_cached_obs(
-                    key,
-                    self._zoo_tick if step is None else step,
-                    getattr(self, "_debug_images", None),
-                    idx,
-                )
+            # The frame staged on the previous call is judged now. Deferring by one step
+            # is what lets the current observation always be cached without duplicating
+            # it: while a frame is staged it already reaches the model as the live last
+            # block of mem_seq, so admitting it here would put it in twice.
+            if pool["staged"] is not None:
+                s_tok, s_a, s_step, s_img = pool["staged"]
+                if len(pool["tokens"]) < cap:
+                    pool["tokens"].append(s_tok)
+                    pool["attn"].append(s_a)
+                    pool["step_ids"].append(s_step)
+                    admitted = s_step
+                else: # len(pool["tokens"]) == cap, then if the pool['staged'] is append, its index is cap
+                    # Score the candidate TOGETHER with the residents and drop the
+                    # argmin. If the candidate is itself the worst it is simply not
+                    # admitted -- otherwise a redundant frame displaces a block that
+                    # covers part of the trajectory nothing else does, then gets
+                    # displaced in turn, and the pool churns without gaining coverage.
+                    scores = self.pool_scores(
+                        pool["tokens"] + [s_tok],
+                        pool["step_ids"] + [s_step],
+                        pool["attn"] + [s_a],
+                    )
+                    lo = int(scores.argmin())
+                    if lo < cap:
+                        if _MEM_DEBUG:
+                            _drop_cached_obs(key, pool["step_ids"][lo])
+                        pool["tokens"][lo] = s_tok
+                        pool["attn"][lo] = s_a
+                        pool["step_ids"][lo] = s_step
+                        admitted = s_step
+                    # else: the candidate is the worst, so it is not admitted and the pool is unchanged.
+                if _MEM_DEBUG and admitted is not None:
+                    _save_cached_obs(key, s_step, None if s_img is None else [s_img], 0)
 
-            # viz_dir = "runs/robomme/attn_logs"
-            # os.makedirs(viz_dir, exist_ok=True)
-
-            # viz_file = os.path.join(viz_dir, f"ep_{key}.txt")
-
-            # with open(viz_file, "a") as f:
-            #     f.write(f"Step {step}: Trans_score {trans_score}, Added to pool: {add_to_pool}\n")
+            # Always cache the current observation. It competes for a pool slot on the
+            # next call; this step it reaches the model as the live mem_seq block.
+            imgs = getattr(self, "_debug_images", None) if _MEM_DEBUG else None
+            pool["staged"] = (
+                current[idx].detach(),
+                a,
+                step_id,
+                imgs[idx] if imgs is not None and idx < len(imgs) else None,
+            )
 
             # Oldest-first ordering: replacement scrambles insertion order, but the
             # memory transformer's block-RoPE encodes temporal position, so the blocks
@@ -420,10 +478,13 @@ class Gr00tN1d6ActionHead(nn.Module):
                 # tells us how many of the K blocks are real history. uniq==1 means the
                 # pool is being reset every call and memory carries nothing.
                 uniq = len({id(t) for t in past} | {id(current[idx])})
+                # `steps` is the pool's temporal coverage: if it collapses onto a narrow
+                # recent range the density term is not doing its job.
                 print(
-                    f"[mem] pool ep={key} restart={restart} trans={trans_score:.5f} "
-                    f"added={add_to_pool} pool={len(pool['tokens'])}/{K_target - 1} "
-                    f"uniq_blocks={uniq}/{K_target}",
+                    f"[mem] pool ep={key} restart={restart} step={step_id} "
+                    f"admitted={admitted} pool={len(pool['tokens'])}/{K_target - 1} "
+                    f"uniq_blocks={uniq}/{K_target} "
+                    f"steps={sorted(pool['step_ids'])}",
                     flush=True,
                 )
 

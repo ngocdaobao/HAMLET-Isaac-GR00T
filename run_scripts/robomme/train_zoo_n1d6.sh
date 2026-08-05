@@ -46,7 +46,7 @@ MEMORY_MODE="${MEMORY_MODE:-zoo}"             # zoo | window  (see header)
 # Memory-transformer sequence length T = pool target. The pool holds K-1 PAST
 # observations plus the current one. K=1 leaves no room for history at all, so zoo
 # needs K>=2; K=4 matches the HAMLET default window.
-K="${K:-10}"                                   # memory window = history length
+K="${K:-12}"                                   # memory window = history length
 ZOO_MAX_EPISODES="${ZOO_MAX_EPISODES:-4096}"  # LRU cap on how many episodes keep a pool
 MEMORY_STRIDE="${MEMORY_STRIDE:-16}"          # env steps between snapshots; set equal to the eval n_action_steps
 N_MOMENT_TOKENS="${N_MOMENT_TOKENS:-4}"       # moment tokens per step (n_q)
@@ -55,7 +55,7 @@ MEMORY_TYPE="${MEMORY_TYPE:-moment_token}"    # moment_token | vision_feature
 LOAD_MOMENT_TOKENS_FROM="${LOAD_MOMENT_TOKENS_FROM:-}"  # optional Stage-1 (TCL) ckpt; see README "Moment-token initialization"
 FREEZE_MOMENT_TOKENS="${FREEZE_MOMENT_TOKENS:-0}"       # 1 = freeze moment tokens (paper recipe when TCL-initialized)
 USE_KEY_MOMENT_GATE="${USE_KEY_MOMENT_GATE:-1}"        # 1 = zero memory on non-key-moment steps; 0 = plain HAMLET. Saved to checkpoint config -> eval inherits it.
-DELTA_THRESHOLD="${DELTA_THRESHOLD:-0.5}"              # key-moment threshold on normalized-joint window-end delta (only used when gate on)
+DELTA_THRESHOLD="${DELTA_THRESHOLD:-0.4}"              # key-moment threshold on normalized-joint window-end delta (only used when gate on)
 # Anchor ordering. SEQUENTIAL_ANCHORS=1 marches each batch slot forward through one
 # demonstration: slot i at iteration t+1 holds the next anchor of the same episode it
 # held at iteration t, so a (B, d) state cache stays row-aligned across iterations.
@@ -77,6 +77,14 @@ SHARD_SIZE="${SHARD_SIZE:-1024}"
 # advances each episode by one anchor per appearance, so that episode's observations
 # still arrive in temporal order ANCHOR_STRIDE apart -- which is all the pool needs.
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
+
+
+# Memory pool selection hyperparameters (see gr00t_n1d6.py _pool_density)
+ZOO_DENSITY_WEIGHT="${ZOO_DENSITY_WEIGHT:-0.5}"
+ZOO_STEP_TAU="${ZOO_STEP_TAU:-0.15}"
+ZOO_DIST_TAU="${ZOO_DIST_TAU:-1.0}"
+ZOO_DENSITY_K="${ZOO_DENSITY_K:-4}"
+ZOO_DENSITY_TEMP="${ZOO_DENSITY_TEMP:-2.0}"
 
 if [ "$MEMORY_MODE" = "zoo" ]; then
     if [ "$K" -lt 2 ]; then

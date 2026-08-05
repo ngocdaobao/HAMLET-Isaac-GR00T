@@ -7,7 +7,7 @@ from gr00t.data.embodiment_tags import EmbodimentTag
 
 @dataclass
 class FinetuneConfig:
-    """
+    """ 
     Configuration for fine-tuning a Vision-Language-Action (VLA) model.
 
     This dataclass defines all parameters needed to launch a fine-tuning job
@@ -201,7 +201,43 @@ class FinetuneConfig:
 
     zoo_max_episodes: int = 4096
     """Cap on how many episodes the zoo pool keeps; least-recently-seen entries are
-    evicted. Each entry holds (memory_window-1) x n_moment_tokens x d activations."""
+    evicted. Each entry holds (memory_window-1) x n_moment_tokens x d activations.
+    At memory_window=12 that is ~176 KB/episode, so the default cap reserves ~720 MB. 
+    Only a few x the per-rank batch size is ever in flight -- lower it accordingly."""
+
+    zoo_density_weight: float = 0.5
+    """w in the pool eviction score: (1-w)*rank(attn) - w*softmax(log local_density).
+    0 = keep the blocks the instruction attends to most, ignoring redundancy.
+    1 = keep the blocks that best cover the trajectory, ignoring the instruction."""
+
+    zoo_step_tau: float = 0.15
+    """How hard the step gap weights the distance, via omega = 1 + dstep/tau on gaps
+    normalized to [0,1]. tau is the gap at which a neighbour's distance counts double,
+    and omega tops out at 1 + 1/tau.
+
+    This is the knob for temporal spread vs. catching revisits. Small (0.05, omega up
+    to 21x) heavily discounts anything far in time, so the pool spreads across the
+    episode but a state revisited much later is no longer recognized as a duplicate.
+    Large (1.0, omega up to 2x) barely discounts it, so revisits are caught but the
+    pool is free to cluster in time."""
+
+    zoo_dist_tau: float = 0.5
+    """Bandwidth of the appearance kernel, exp(-d / tau_d). Tokens are L2-normalized
+    before cdist, so d lies in [0, 2] -- roughly 0 for near-duplicate frames and 1.2-1.4
+    for unrelated ones -- and this bandwidth keeps a fixed meaning as backbone features
+    drift. Small -> only near-duplicates register as redundant."""
+
+    zoo_density_k: int = 5
+    """Neighbourhood size for the kNN density estimate, clamped to pool_size-1.
+    Small -> only near-duplicates are penalized; large -> being anywhere in a
+    crowded region is penalized."""
+
+    zoo_density_temp: float = 2.0
+    """Softmax temperature normalizing the density across the pool. After the max
+    rescale this is exactly (sigma / sigma.max()) ** (1/temp), so <1 sharpens (only
+    the densest block is penalized) and >1 flattens. Above 1 is usually right:
+    sigma is 1/distance and therefore heavy-tailed, so at temp=1 a single pair of
+    near-duplicate blocks saturates the term and every other block reads as 0."""
 
     memory_type: Literal["moment_token", "vision_feature"] = "moment_token"
     """What flows through the memory module (action-head VLM conditioning is unchanged).

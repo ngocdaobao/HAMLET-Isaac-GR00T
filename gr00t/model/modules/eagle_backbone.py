@@ -247,15 +247,15 @@ class EagleBackbone(torch.nn.Module):
         }
 
         if self.memory_mode == "zoo":
-            # Saliency descriptor for the zoo memory cache: how the moment tokens spread
-            # their last-layer attention over the image tokens.
+            # Saliency descriptor for the zoo memory cache: how much of the text tokens'
+            # last-layer attention lands on the image tokens.
             # NOTE: `output_attentions=True` is NOT usable here. Eagle3-VL asserts
             # flash_attention_2 for the LM, and FA2 never materializes the attention
             # matrix, so HF returns None for `outputs.attentions` (or silently falls back
             # to eager, which materializes a (B, H, L, L) tensor per layer -> OOM at these
             # sequence lengths). Instead recompute the final layer's attention exactly,
-            # for the n_q moment-token query rows only.
-            attn_map = self._moment_to_image_attention(
+            # for the text query rows only.
+            attn_map = self.text_to_img_attention(
                 hidden_in=outputs.hidden_states[-2],
                 position_ids=position_ids,
                 attention_mask_ext=attention_mask_ext,
@@ -263,18 +263,20 @@ class EagleBackbone(torch.nn.Module):
                 n_q=n_q,
             )
             if attn_map is None:
-                # Fallback descriptor: L2-normalized mean image-token hidden state. Not an
-                # attention map, but it still measures "how much the observation changed".
-                img_feat = last_hidden[image_mask.bool()].view(B, -1, last_hidden.shape[-1])
-                attn_map = torch.nn.functional.normalize(
-                    img_feat.float().mean(dim=1), dim=-1
-                ).unsqueeze(1)
-            data["mem_attn_score"] = attn_map.detach()  # (B, n_q, n_img) or (B, 1, d)
+                # No usable read-out. The zoo pool consumes this as a per-sample scalar
+                # "how relevant is this frame to the instruction", and no descriptor
+                # derivable from the hidden states alone answers that on an absolute
+                # scale -- the old (B, 1, d) mean-hidden-state vector only measured
+                # frame-to-frame CHANGE, which the pool no longer scores on. Emit a flat
+                # signal instead, so pool_scores drops the relevance term and selects on
+                # local density alone rather than on a stand-in that means nothing.
+                attn_map = torch.zeros(B, device=last_hidden.device, dtype=torch.float32)
+            data["mem_attn_score"] = attn_map.detach()  # (B,)
 
         return BatchFeature(data=data)
 
     @torch.no_grad()
-    def _moment_to_image_attention(
+    def text_to_img_attention(
         self,
         hidden_in: torch.Tensor,
         position_ids: torch.Tensor,
@@ -282,15 +284,28 @@ class EagleBackbone(torch.nn.Module):
         image_mask_ext: torch.Tensor,
         n_q: int,
     ):
-        """Exact last-decoder-layer attention from the moment tokens to the image tokens.
+        """Last-decoder-layer attention mass from the text tokens onto the image tokens.
 
         `hidden_in` is hidden_states[-2] -- the input to the final decoder layer -- so
-        re-running that layer's input_layernorm and q/k projections reproduces its
-        attention logits exactly. Only n_q query rows are computed, so this costs one
-        (B, H, n_q, L) matmul instead of a full (B, H, L, L) attention matrix.
+        re-running that layer's input_layernorm and q/k projections reproduces that
+        layer's queries and keys exactly.
 
-        Returns (B, n_q, n_img) probabilities renormalized over the image tokens, or None
-        if the LM internals don't match the expected Qwen-style layout.
+        No causal mask is applied, by design: text and image arrive together as one joint
+        observation here rather than as an autoregressive prediction step, so every text
+        token is allowed to see the whole image block regardless of which side of it the
+        token sits on. Only the right-padding columns are masked out. (Consequence: these
+        are not the probabilities the causal LM itself computed -- they are a saliency
+        read-out over the same q/k.)
+
+        Text tokens are scattered -- they can sit on either side of the image block -- and
+        ragged across the batch, so their query rows are gathered by exact position into a
+        (B, max_text) block, right-padded with filler indices that `q_valid` masks off.
+        That keeps the matmul at (B, H, max_text, L) instead of a full (B, H, L, L)
+        attention matrix, which would OOM at these sequence lengths.
+
+        Returns (B,): per sample, the attention from its text tokens onto its image
+        tokens, averaged over both. None if the LM internals don't match the expected
+        Qwen-style layout, or a sample has no text or no image tokens.
         """
         try:
             lm = self.model.language_model.model
@@ -298,27 +313,59 @@ class EagleBackbone(torch.nn.Module):
             attn = layer.self_attn
 
             h = layer.input_layernorm(hidden_in)  # (B, L, C)
-            B, L, _ = h.shape
+            B, L, C = h.shape
+            device = h.device
             head_dim = getattr(attn, "head_dim", None)
             if head_dim is None:
                 head_dim = attn.q_proj.out_features // attn.config.num_attention_heads
 
-            q = attn.q_proj(h[:, -n_q:, :]).view(B, n_q, -1, head_dim)
+            valid = attention_mask_ext.bool()  # (B, L) real (non-pad) tokens
+            img_mask = image_mask_ext.bool()  # (B, L)
+            # Text = real, not an image placeholder, and not one of the appended moment
+            # tokens. attention_mask_ext is 1 over the moment tokens and image_mask is 0
+            # there, so they have to be cut off explicitly or they count as text.
+            text_mask = valid & ~img_mask
+            if n_q > 0:
+                text_mask[:, L - n_q :] = False
+
+            n_text = text_mask.sum(dim=1)  # (B,)
+            n_img = img_mask.sum(dim=1)  # (B,)
+            if int(n_text.min()) == 0 or int(n_img.min()) == 0:
+                return None  # nothing to average over -> no descriptor
+
+            # Gather the text rows by exact position. A contiguous window from the first
+            # text token would spend slots on the image block and silently truncate the
+            # text that follows it. Sorting a key that is the token's own position for
+            # text and L everywhere else lists the text positions in order, then fillers;
+            # the fillers are clamped back into range and dropped by q_valid below.
+            # (torch.sort rather than argsort(stable=...) for older-torch compatibility.)
+            pos = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)  # (B, L)
+            sort_key = torch.where(text_mask, pos, torch.full_like(pos, L))
+            max_text = int(n_text.max())
+            q_idx = sort_key.sort(dim=1).values[:, :max_text].clamp(max=L - 1)  # (B, max_text)
+            q_valid = torch.arange(max_text, device=device).unsqueeze(0) < n_text.unsqueeze(1) # (B, max_text)
+
+            text_query = h.gather(1, q_idx.unsqueeze(-1).expand(-1, -1, C))  # (B, max_text, C)
+            q = attn.q_proj(text_query).view(B, max_text, -1, head_dim)
             k = attn.k_proj(h).view(B, L, -1, head_dim)
+
             # Qwen3 normalizes each head before RoPE; Qwen2/Llama have no q_norm/k_norm.
             if getattr(attn, "q_norm", None) is not None:
                 q = attn.q_norm(q)
             if getattr(attn, "k_norm", None) is not None:
                 k = attn.k_norm(k)
-            q = q.transpose(1, 2)  # (B, H, n_q, Dh)
+            q = q.transpose(1, 2)  # (B, H, max_text, Dh)
             k = k.transpose(1, 2)  # (B, H_kv, L, Dh)
 
             rotary = getattr(lm, "rotary_emb", None)
             if rotary is not None:
-                cos, sin = rotary(h, position_ids)  # (B, L, Dh)
-                cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)  # (B, 1, L, Dh)
-                q = _apply_rope(q, cos[:, :, -n_q:, :], sin[:, :, -n_q:, :])
-                k = _apply_rope(k, cos, sin)
+                # Each query carries the RoPE position of the row it was gathered from,
+                # not its index inside the gathered block.
+                q_pos = position_ids.gather(1, q_idx)  # (B, max_text)
+                cos_q, sin_q = rotary(text_query, q_pos)  # (B, max_text, Dh)
+                cos_k, sin_k = rotary(h, position_ids)  # (B, L, Dh)
+                q = _apply_rope(q, cos_q.unsqueeze(1), sin_q.unsqueeze(1))
+                k = _apply_rope(k, cos_k.unsqueeze(1), sin_k.unsqueeze(1))
 
             # GQA: broadcast the kv heads up to the query heads.
             n_rep = q.shape[1] // k.shape[1]
@@ -328,22 +375,22 @@ class EagleBackbone(torch.nn.Module):
             logits = torch.matmul(q.float(), k.float().transpose(-1, -2)) / (head_dim**0.5)
             # The moment tokens sit after the right padding, so pad columns must be masked
             # out before the softmax or they steal probability mass.
-            logits = logits.masked_fill(
-                ~attention_mask_ext.bool()[:, None, None, :], torch.finfo(logits.dtype).min
-            )
-            probs = torch.softmax(logits, dim=-1).mean(dim=1)  # over heads -> (B, n_q, L)
+            logits = logits.masked_fill(~valid[:, None, None, :], torch.finfo(logits.dtype).min)
+            probs = torch.softmax(logits, dim=-1).mean(dim=1)  # over heads -> (B, max_text, L)
 
-            img_mask = image_mask_ext.bool()
-            n_img = int(img_mask[0].sum().item())
-            if n_img == 0 or not bool((img_mask.sum(dim=1) == n_img).all()):
-                return None  # ragged image-token counts -> no fixed-width descriptor
-            img_probs = probs[img_mask.unsqueeze(1).expand(-1, n_q, -1)].view(B, n_q, n_img)
-            # Renormalize over image tokens so the L1 distance between two timesteps
-            # reflects *where* attention moved, not the text/image mass ratio.
-            return img_probs / (img_probs.sum(dim=-1, keepdim=True) + 1e-8)
+            # Drop the filler query rows, then keep only the image-token columns.
+            probs = probs * q_valid.unsqueeze(-1).to(probs.dtype)
+            probs = probs * img_mask.unsqueeze(1).to(probs.dtype)
+
+            # Average over the sample's real text tokens, then over its image tokens.
+            text_to_img_attn = probs.sum(dim=1) / n_text.unsqueeze(1).to(probs.dtype)  # (B, L)
+            text_to_img_attn = text_to_img_attn.sum(dim=1) / n_img.to(probs.dtype)  # (B,)
+
+            return text_to_img_attn
+
         except Exception as e:  # depends on the installed transformers internals
             logger.warning(
-                f"[zoo] moment->image attention read-out unavailable "
+                f"[zoo] text->image attention read-out unavailable "
                 f"({type(e).__name__}: {e}); using hidden-state descriptor instead."
             )
             return None

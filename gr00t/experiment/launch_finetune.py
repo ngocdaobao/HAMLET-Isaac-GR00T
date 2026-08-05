@@ -109,6 +109,11 @@ if __name__ == "__main__":
     config.model.memory_type = ft_config.memory_type
     config.model.memory_mode = ft_config.memory_mode
     config.model.zoo_max_episodes = ft_config.zoo_max_episodes
+    config.model.zoo_density_weight = ft_config.zoo_density_weight
+    config.model.zoo_step_tau = ft_config.zoo_step_tau
+    config.model.zoo_dist_tau = ft_config.zoo_dist_tau
+    config.model.zoo_density_k = ft_config.zoo_density_k
+    config.model.zoo_density_temp = ft_config.zoo_density_temp
     config.model.use_key_moment_gate = ft_config.use_key_moment_gate
     config.model.delta_threshold = ft_config.delta_threshold
     if (
