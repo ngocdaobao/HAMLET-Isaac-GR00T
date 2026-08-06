@@ -482,7 +482,7 @@ class Gr00tN1d6ActionHead(nn.Module):
         pool["tokens"][victim] = s_tok
         pool["attn"][victim] = s_a
         pool["step_ids"][victim] = s_step
-        return s_step, victim
+        return s_step
 
     @torch.no_grad()
     def admit_global(self, pool, cand, cap: int):
