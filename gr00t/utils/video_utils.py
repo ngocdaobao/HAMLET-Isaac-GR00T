@@ -26,8 +26,11 @@ def _lazy_import_torchcodec():
         import torchcodec
 
         return torchcodec
-    except (ImportError, RuntimeError):
-        raise ImportError("torchcodec is not available.")
+    except (ImportError, RuntimeError) as e:
+        # Keep the original message: a RuntimeError here is almost always the dynamic
+        # loader failing to find libavutil.so.59 & friends, i.e. LD_LIBRARY_PATH was not
+        # set before python started. Swallowing it makes the fallback impossible to debug.
+        raise ImportError(f"torchcodec is not available: {e}") from e
 
 
 def _lazy_import_decord():
@@ -39,7 +42,7 @@ def _lazy_import_decord():
     except ImportError:
         raise ImportError("decord is not available. Install it with: pip install decord")
 
-
+ 
 # Known-bad backend+codec combinations that cause silent failures (issue #342).
 # torchvision_av with h265/hevc reads only the first frame without error,
 # leading to policies that train but never learn from visual input.
@@ -48,7 +51,11 @@ _INCOMPATIBLE_BACKEND_CODECS: dict[str, set[str]] = {
 }
 
 # Preferred fallback order when the requested backend is unavailable or incompatible.
-_BACKEND_FALLBACK_ORDER = ["torchcodec", "decord", "pyav", "ffmpeg"]
+# Only backends implemented by *every* reader below belong here: "pyav" is implemented
+# by get_all_frames alone and "torchvision_av" by get_frames_by_timestamps alone, so
+# falling back to either turns a missing decoder into a bare NotImplementedError deep
+# inside a dataloader worker.
+_BACKEND_FALLBACK_ORDER = ["torchcodec", "decord", "ffmpeg"]
 
 
 def _is_backend_available(backend: str) -> bool:
@@ -57,7 +64,8 @@ def _is_backend_available(backend: str) -> bool:
         try:
             _lazy_import_torchcodec()
             return True
-        except ImportError:
+        except ImportError as e:
+            logger.warning("Video backend 'torchcodec' is unavailable: %s", e)
             return False
     elif backend == "decord":
         try:
@@ -399,7 +407,10 @@ def get_frames_by_indices(
         frames = np.array(frames)
         return frames
     else:
-        raise NotImplementedError
+        raise NotImplementedError(
+            f"get_frames_by_indices does not implement video backend '{video_backend}'. "
+            f"Supported: torchcodec, decord, ffmpeg, opencv."
+        )
 
 
 def get_frames_by_timestamps(
@@ -521,7 +532,10 @@ def get_frames_by_timestamps(
             reader = None
 
     else:
-        raise NotImplementedError
+        raise NotImplementedError(
+            f"get_frames_by_timestamps does not implement video backend '{video_backend}'. "
+            f"Supported: torchcodec, decord, ffmpeg, opencv, torchvision_av."
+        )
 
 
 def get_all_frames(
@@ -561,7 +575,10 @@ def get_all_frames(
         return np.stack(frames), np.array(timestamps)
 
     else:
-        raise NotImplementedError
+        raise NotImplementedError(
+            f"get_all_frames does not implement video backend '{video_backend}'. "
+            f"Supported: torchcodec, decord, ffmpeg, pyav."
+        )
 
 
 def get_accumulate_timestamp_idxs(

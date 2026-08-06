@@ -13,6 +13,8 @@ cd "$REPO_ROOT"
 module load gcc/13.2.0
 module load cuda/12.6.2
 
+CUDA_VISIBLE_DEVICES=1
+
 # config (override via env)
 MODEL_PATH="${MODEL_PATH:?set MODEL_PATH to your checkpoint dir (.../checkpoint-N)}"
 MODEL_PATH="${MODEL_PATH%/}"

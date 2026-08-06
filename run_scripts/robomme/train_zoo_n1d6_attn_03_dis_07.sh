@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # GR00T N1.6 + HAMLET "zoo" fine-tune -- history-aware policy with a cross-iteration
 # memory pool instead of a within-batch memory window.
-# Usage: VIZ_BATCH_DIR=runs/robomme DATASET_PATH=data/robomme bash run_scripts/robomme/train_zoo_n1d6.sh
+# Usage: VIZ_BATCH_DIR=runs/robomme DATASET_PATH=data/robomme bash run_scripts/robomme/train_zoo_n1d6_attn_03_dis_07.sh
 #   RoboMME modality (8-D abs-joint / 2-view) is preset (robomme_config.py).
 #
 # How zoo differs from the original HAMLET window (--memory-mode window):
@@ -101,7 +101,7 @@ DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
 
 
 # Memory pool selection hyperparameters (see gr00t_n1d6.py _pool_density)
-ZOO_DENSITY_WEIGHT="${ZOO_DENSITY_WEIGHT:-0.5}"
+ZOO_DENSITY_WEIGHT="${ZOO_DENSITY_WEIGHT:-0.7}"
 ZOO_STEP_TAU="${ZOO_STEP_TAU:-0.15}"
 ZOO_DIST_TAU="${ZOO_DIST_TAU:-1.0}"
 ZOO_DENSITY_K="${ZOO_DENSITY_K:-4}"
