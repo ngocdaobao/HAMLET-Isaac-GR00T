@@ -136,6 +136,9 @@ class Gr00tN1d6Config(PretrainedConfig):
     zoo_dist_tau: float = 0.5  # how close in appearance counts as redundant
     zoo_density_k: int = 4  # kNN neighbourhood size for the density estimate
     zoo_density_temp: float = 2.0  # softmax temperature normalizing density over the pool
+    # True: a candidate competes only with pool blocks in its own temporal bucket, so
+    # coverage of the episode is structural. False: original global-argmin eviction.
+    zoo_stratified: bool = True
     # Key-moment gate: when True, memory is zeroed out on non-key-moment steps
     # (window-end joint-state delta >= delta_threshold). When False, memory is
     # never gated -> plain HAMLET. Persisted to the checkpoint config so eval

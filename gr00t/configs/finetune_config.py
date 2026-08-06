@@ -239,6 +239,21 @@ class FinetuneConfig:
     sigma is 1/distance and therefore heavy-tailed, so at temp=1 a single pair of
     near-duplicate blocks saturates the term and every other block reads as 0."""
 
+    zoo_stratified: bool = True
+    """How a staged block competes for a pool slot.
+
+    True: the pool's (memory_window - 1) slots are treated as equal-width temporal bins
+    over the episode's elapsed span, and a candidate competes only with residents of its
+    own bin -- so one phase cannot own more of the pool than its share of the timeline.
+    When the pool is full and the candidate's bin is empty, the slot is taken from the
+    most crowded bin.
+
+    False: the original global-argmin eviction. That rule cannot bound per-phase
+    occupancy, because both terms of `pool_scores` are normalized within the pool
+    (rank01 over attention, softmax over log-density): once the pool has collapsed onto
+    one phase every block scores alike, the density term goes flat, and selection falls
+    back to raw instruction saliency -- which prefers that same phase."""
+
     memory_type: Literal["moment_token", "vision_feature"] = "moment_token"
     """What flows through the memory module (action-head VLM conditioning is unchanged).
     "moment_token": learnable moment tokens' post-LLM hidden states.

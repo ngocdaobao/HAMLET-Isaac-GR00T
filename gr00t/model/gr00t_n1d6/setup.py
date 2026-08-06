@@ -102,6 +102,7 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                 zoo_dist_tau=self.config.model.zoo_dist_tau,
                 zoo_density_k=self.config.model.zoo_density_k,
                 zoo_density_temp=self.config.model.zoo_density_temp,
+                zoo_stratified=self.config.model.zoo_stratified,
             )
 
             # Initialize mask_tokens if they are not present in the base checkpoint

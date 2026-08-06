@@ -1,3 +1,4 @@
+from collections import Counter
 from typing import Any, Tuple
 
 from gr00t.configs.model.gr00t_n1d6 import Gr00tN1d6Config
@@ -353,6 +354,109 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         return (1.0 - w) * rel - w * dens
 
+    @staticmethod
+    def temporal_buckets(step_ids, n_buckets: int, first_step: int | None = None):
+        """Bin each step into one of `n_buckets` equal-width slices of the episode's
+        elapsed span [first_step, latest].
+
+        Boundaries are recomputed on every call against the CURRENT latest step, so the
+        span grows with the episode and earlier blocks compress down into the low bins.
+        That is what lets the pool re-spread: whatever the first phase deposited in the
+        high bins drifts downward and vacates them for later phases, instead of holding
+        its slots for the rest of the rollout.
+        """
+        lo = min(step_ids) if first_step is None else min(first_step, min(step_ids))
+        span = max(max(step_ids) - lo, 1)
+        return [min(int((s - lo) * n_buckets / span), n_buckets - 1) for s in step_ids]
+
+    @torch.no_grad()
+    def admit_stratified(self, pool, cand, cap: int):
+        """Admit a staged block by competing it only against residents of its own
+        temporal bucket. Returns the admitted step id, or None if it was rejected.
+
+        The global argmin of `pool_scores` cannot bound how much of the pool one phase
+        owns: both of its terms are normalized WITHIN the pool (rank01 over attention,
+        softmax over log-density), so once the pool has collapsed onto a single phase
+        every block scores alike, the density term goes flat, and selection degenerates
+        to raw instruction saliency -- which prefers that same phase. Restricting the
+        contest to a bucket makes coverage a structural property instead of something a
+        soft penalty has to win.
+        """
+        s_tok, s_a, s_step = cand
+        n = len(pool["tokens"])
+        if cap <= 0:
+            return None  # memory_window == 1 leaves no room for history
+        if n < cap:
+            # Warm-up. Appending unconditionally lets the opening phase fill the pool,
+            # but unlike the old rule it keeps no privilege: from the first full call
+            # onward every admission thins the most over-subscribed bucket, so the
+            # opening burst is competed away over the following anchors.
+            pool["tokens"].append(s_tok)
+            pool["attn"].append(s_a)
+            pool["step_ids"].append(s_step)
+            return s_step
+
+        steps_all = pool["step_ids"] + [s_step]
+        buckets = self.temporal_buckets(steps_all, cap, pool["first_step"])
+        cand_b, res_b = buckets[-1], buckets[:-1]
+
+        # Occupancy the pool WOULD have if the candidate were admitted -- counted over
+        # `buckets`, i.e. residents AND candidate, because what is being balanced is the
+        # post-admission histogram. The block to drop is the weakest member of whichever
+        # bucket is then most over-subscribed: when that is the candidate's own bucket it
+        # is in the contest and can lose; when it is some other bucket the candidate is
+        # opening temporal coverage nothing else has, so it displaces a block from the
+        # region the pool over-covers.
+        crowded = max(Counter(buckets).items(), key=lambda kv: kv[1])[0]
+
+        cand_idx = len(res_b)
+        group = [i for i, b in enumerate(res_b) if b == crowded]
+        if cand_b == crowded:
+            group.append(cand_idx)
+        if len(group) < 2:
+            return None  # every bucket holds one block already: coverage is uniform
+
+        scores = self.pool_scores(
+            pool["tokens"] + [s_tok], steps_all, pool["attn"] + [s_a]
+        )
+        victim = min(group, key=lambda i: float(scores[i]))
+        if victim == cand_idx:
+            return None  # weakest block in its own bucket -> not admitted
+
+        if _MEM_DEBUG:
+            _drop_cached_obs(pool["key"], pool["step_ids"][victim])
+        pool["tokens"][victim] = s_tok
+        pool["attn"][victim] = s_a
+        pool["step_ids"][victim] = s_step
+        return s_step
+
+    @torch.no_grad()
+    def admit_global(self, pool, cand, cap: int):
+        """Original admission: score the candidate together with every resident and drop
+        the global argmin. Kept behind `zoo_stratified=False` to A/B against
+        `admit_stratified`. Returns the admitted step id, or None.
+        """
+        s_tok, s_a, s_step = cand
+        if len(pool["tokens"]) < cap:
+            pool["tokens"].append(s_tok)
+            pool["attn"].append(s_a)
+            pool["step_ids"].append(s_step)
+            return s_step
+        scores = self.pool_scores(
+            pool["tokens"] + [s_tok],
+            pool["step_ids"] + [s_step],
+            pool["attn"] + [s_a],
+        )
+        lo = int(scores.argmin())
+        if lo >= cap:
+            return None  # the candidate is the worst; pool unchanged
+        if _MEM_DEBUG:
+            _drop_cached_obs(pool["key"], pool["step_ids"][lo])
+        pool["tokens"][lo] = s_tok
+        pool["attn"][lo] = s_a
+        pool["step_ids"][lo] = s_step
+        return s_step
+
     def process_mem_cache(
         self,
         backbone_output: BatchFeature,
@@ -404,8 +508,11 @@ class Gr00tN1d6ActionHead(nn.Module):
                 or (step is not None and pool["last_step"] is not None and step <= pool["last_step"])
             )
             if restart:
+                # `first_step` anchors the temporal bucket boundaries; `key` lets the
+                # admission helpers drop the debug frame of whatever they evict.
                 pool = {"tokens": [], "step_ids": [], "attn": [],
-                        "staged": None, "last_step": None}
+                        "staged": None, "last_step": None,
+                        "first_step": None, "key": key}
                 self.memory_pool[key] = pool
                 if _MEM_DEBUG:
                     _clear_cached_obs(key)
@@ -414,8 +521,12 @@ class Gr00tN1d6ActionHead(nn.Module):
             a = attn_score[idx]
             pool["last_step"] = step
             step_id = self._zoo_tick if step is None else step
-            cap = K_target
+            # The pool holds PAST blocks only -- mem_seq is `past + [current]` and must
+            # come to exactly K_target blocks, so the pool caps at K_target - 1.
+            cap = K_target - 1
             admitted = None
+            if pool["first_step"] is None:
+                pool["first_step"] = step_id
 
             # The frame staged on the previous call is judged now. Deferring by one step
             # is what lets the current observation always be cached without duplicating
@@ -423,31 +534,12 @@ class Gr00tN1d6ActionHead(nn.Module):
             # block of mem_seq, so admitting it here would put it in twice.
             if pool["staged"] is not None:
                 s_tok, s_a, s_step, s_img = pool["staged"]
-                if len(pool["tokens"]) < cap:
-                    pool["tokens"].append(s_tok)
-                    pool["attn"].append(s_a)
-                    pool["step_ids"].append(s_step)
-                    admitted = s_step
-                else: # len(pool["tokens"]) == cap, then if the pool['staged'] is append, its index is cap
-                    # Score the candidate TOGETHER with the residents and drop the
-                    # argmin. If the candidate is itself the worst it is simply not
-                    # admitted -- otherwise a redundant frame displaces a block that
-                    # covers part of the trajectory nothing else does, then gets
-                    # displaced in turn, and the pool churns without gaining coverage.
-                    scores = self.pool_scores(
-                        pool["tokens"] + [s_tok],
-                        pool["step_ids"] + [s_step],
-                        pool["attn"] + [s_a],
-                    )
-                    lo = int(scores.argmin())
-                    if lo < cap:
-                        if _MEM_DEBUG:
-                            _drop_cached_obs(key, pool["step_ids"][lo])
-                        pool["tokens"][lo] = s_tok
-                        pool["attn"][lo] = s_a
-                        pool["step_ids"][lo] = s_step
-                        admitted = s_step
-                    # else: the candidate is the worst, so it is not admitted and the pool is unchanged.
+                admit = (
+                    self.admit_stratified
+                    if getattr(self.config, "zoo_stratified", True)
+                    else self.admit_global
+                )
+                admitted = admit(pool, (s_tok, s_a, s_step), cap)
                 if _MEM_DEBUG and admitted is not None:
                     _save_cached_obs(key, s_step, None if s_img is None else [s_img], 0)
 
@@ -478,12 +570,20 @@ class Gr00tN1d6ActionHead(nn.Module):
                 # tells us how many of the K blocks are real history. uniq==1 means the
                 # pool is being reset every call and memory carries nothing.
                 uniq = len({id(t) for t in past} | {id(current[idx])})
-                # `steps` is the pool's temporal coverage: if it collapses onto a narrow
-                # recent range the density term is not doing its job.
+                # `steps` is the pool's temporal coverage and `buckets` is how many of
+                # the K-1 temporal bins it actually occupies: bins==pool means the pool
+                # is spread evenly over the episode so far, bins << pool means it has
+                # collapsed onto a few phases.
+                if pool["step_ids"]:
+                    occupied = len(
+                        set(self.temporal_buckets(pool["step_ids"], cap, pool["first_step"]))
+                    )
+                else:
+                    occupied = 0
                 print(
                     f"[mem] pool ep={key} restart={restart} step={step_id} "
-                    f"admitted={admitted} pool={len(pool['tokens'])}/{K_target - 1} "
-                    f"uniq_blocks={uniq}/{K_target} "
+                    f"admitted={admitted} pool={len(pool['tokens'])}/{cap} "
+                    f"bins={occupied}/{cap} uniq_blocks={uniq}/{K_target} "
                     f"steps={sorted(pool['step_ids'])}",
                     flush=True,
                 )
