@@ -9,6 +9,7 @@ from gr00t.model.modules.embodiment_conditioned_mlp import (
     MultiEmbodimentActionEncoder,
 )
 from gr00t.model.modules.memory import MemoryTransformer
+import numpy as np
 import os
 import torch
 import torch.distributed as dist
@@ -24,9 +25,12 @@ import logging
 
 # Set GR00T_MEM_DEBUG=1 to print one line per policy call for the zoo pool and one for
 # the key-moment gate. Meant for eval rollouts; leave unset during training.
-# _MEM_DEBUG = bool(os.environ.get("GR00T_MEM_DEBUG"))
-_MEM_DEBUG = True
-_MEM_DEBUG_DIR = os.environ.get("GR00T_MEM_DEBUG_DIR", "runs/mem_cache_obs")
+_MEM_DEBUG = bool(os.environ.get("GR00T_MEM_DEBUG"))
+# _MEM_DEBUG = False
+# Where the dumped observations go. The eval driver points this at the task currently
+# being evaluated so consecutive tasks do not pile into one tree; the default keeps the
+# old repo-root location for ad-hoc runs.
+_MEM_DEBUG_DIR = os.environ.get("GR00T_MEM_DEBUG_DIR", "runs/mem_cache_obs_pool")
 
 
 def _cached_obs_path(episode, step_id):
@@ -35,8 +39,13 @@ def _cached_obs_path(episode, step_id):
     return os.path.join(_MEM_DEBUG_DIR, f"ep{episode}", f"step{step_id:06d}.png")
 
 
+def _mem_strip_path(episode, step_id):
+    """Path of the per-call strip showing every block the model saw on that call."""
+    return os.path.join(_MEM_DEBUG_DIR, f"ep{episode}", "strips", f"step{step_id:06d}.png")
+
+
 def _save_cached_obs(episode, step_id, images, idx):
-    """Save the observation whose moment tokens were just admitted to the zoo pool.
+    """Save the observation whose moment tokens the zoo pool is now holding.
 
     The pool stores post-LLM moment tokens, not pixels, so the frames are handed over
     by Gr00tPolicy (see `_debug_images`) purely for this dump. Paired with
@@ -66,6 +75,51 @@ def _clear_cached_obs(episode):
     for name in os.listdir(out_dir):
         if name.endswith(".png"):
             os.remove(os.path.join(out_dir, name))
+    strip_dir = os.path.join(out_dir, "strips")
+    if os.path.isdir(strip_dir):
+        for name in os.listdir(strip_dir):
+            if name.endswith(".png"):
+                os.remove(os.path.join(strip_dir, name))
+
+
+def _save_mem_strip(episode, step_id, past_ids, images, idx):
+    """Save one image showing every block the model attends over on this call.
+
+    The per-slot dump next to it is a *live mirror*: a frame disappears the moment its
+    tokens are evicted, so after the fact it only shows the pool's final state. The
+    strip is the per-call record -- `past_ids` are the pool slots in the same
+    oldest-first order `mem_seq` is built in, and the current observation is appended
+    last and outlined so the history is distinguishable from the live frame.
+
+    Past frames are read back from the per-slot dump (written when each was staged)
+    rather than kept in memory; a missing one is skipped, which is what happens if
+    debugging was switched on mid-episode.
+    """
+    if images is None or idx >= len(images):
+        return
+    blocks = []
+    for sid in past_ids:
+        path = _cached_obs_path(episode, sid)
+        if os.path.exists(path):
+            blocks.append(np.asarray(Image.open(path).convert("RGB")))
+    cur = np.ascontiguousarray(images[idx]).copy()
+    t = max(1, min(4, cur.shape[0] // 2, cur.shape[1] // 2))
+    cur[:t, :, :] = cur[-t:, :, :] = cur[:, :t, :] = cur[:, -t:, :] = (0, 255, 0)
+    blocks.append(cur)
+
+    # Blocks are all the same env render size, but guard anyway: a strip is a debug aid
+    # and must never take down a rollout.
+    h, w = blocks[-1].shape[:2]
+    if any(b.shape[:2] != (h, w) for b in blocks):
+        return
+    gap = np.zeros((2, w, 3), dtype=blocks[-1].dtype)
+    stacked = [x for b in blocks for x in (b, gap)][:-1]  # oldest at top, current last
+
+    path = _mem_strip_path(episode, step_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    Image.fromarray(np.vstack(stacked)).save(path)
+
+
 def _rank01(v):
     """Replace each value by its position in the sorted order, scaled to [0,1].
 
@@ -428,7 +482,7 @@ class Gr00tN1d6ActionHead(nn.Module):
         pool["tokens"][victim] = s_tok
         pool["attn"][victim] = s_a
         pool["step_ids"][victim] = s_step
-        return s_step
+        return s_step, victim
 
     @torch.no_grad()
     def admit_global(self, pool, cand, cap: int):
@@ -533,25 +587,26 @@ class Gr00tN1d6ActionHead(nn.Module):
             # it: while a frame is staged it already reaches the model as the live last
             # block of mem_seq, so admitting it here would put it in twice.
             if pool["staged"] is not None:
-                s_tok, s_a, s_step, s_img = pool["staged"]
+                s_tok, s_a, s_step = pool["staged"]
                 admit = (
                     self.admit_stratified
                     if getattr(self.config, "zoo_stratified", True)
                     else self.admit_global
                 )
                 admitted = admit(pool, (s_tok, s_a, s_step), cap)
-                if _MEM_DEBUG and admitted is not None:
-                    _save_cached_obs(key, s_step, None if s_img is None else [s_img], 0)
+                if _MEM_DEBUG and admitted is None:
+                    _drop_cached_obs(key, s_step)
+       
 
             # Always cache the current observation. It competes for a pool slot on the
             # next call; this step it reaches the model as the live mem_seq block.
-            imgs = getattr(self, "_debug_images", None) if _MEM_DEBUG else None
-            pool["staged"] = (
-                current[idx].detach(),
-                a,
-                step_id,
-                imgs[idx] if imgs is not None and idx < len(imgs) else None,
-            )
+            pool["staged"] = (current[idx].detach(), a, step_id)
+            if _MEM_DEBUG:
+                # Dumped now rather than on admission: the staged frame is already one of
+                # the K blocks the model sees, and writing it here keeps the directory a
+                # mirror of mem_seq at every step instead of trailing it by one.
+                imgs = getattr(self, "_debug_images", None)
+                _save_cached_obs(key, step_id, imgs, idx)
 
             # Oldest-first ordering: replacement scrambles insertion order, but the
             # memory transformer's block-RoPE encodes temporal position, so the blocks
@@ -566,6 +621,13 @@ class Gr00tN1d6ActionHead(nn.Module):
             mem_seq.append(torch.stack(past + [current[idx]], dim=0))  # (K_target, n_q, d)
 
             if _MEM_DEBUG:
+                # Same slots, same oldest-first order, same left-padding as `past` above,
+                # so the strip is a faithful picture of the blocks that were just stacked.
+                past_ids = [pool["step_ids"][i] for i in order]
+                if len(past_ids) < K_target - 1:
+                    oldest_id = past_ids[0] if past_ids else step_id
+                    past_ids = [oldest_id] * (K_target - 1 - len(past_ids)) + past_ids
+                _save_mem_strip(key, step_id, past_ids, getattr(self, "_debug_images", None), idx)
                 # Left-padding repeats the SAME tensor object, so counting distinct ids
                 # tells us how many of the K blocks are real history. uniq==1 means the
                 # pool is being reset every call and memory carries nothing.
@@ -574,12 +636,6 @@ class Gr00tN1d6ActionHead(nn.Module):
                 # the K-1 temporal bins it actually occupies: bins==pool means the pool
                 # is spread evenly over the episode so far, bins << pool means it has
                 # collapsed onto a few phases.
-                if pool["step_ids"]:
-                    occupied = len(
-                        set(self.temporal_buckets(pool["step_ids"], cap, pool["first_step"]))
-                    )
-                else:
-                    occupied = 0
                 print(
                     f"[mem] pool ep={key} restart={restart} step={step_id} "
                     f"admitted={admitted} pool={len(pool['tokens'])}/{cap} "
@@ -601,15 +657,21 @@ class Gr00tN1d6ActionHead(nn.Module):
         stale = sorted(self.memory_pool, key=lambda k: self.memory_pool[k]["last_seen"])
         for key in stale[: len(self.memory_pool) - limit]:
             del self.memory_pool[key]
+            if _MEM_DEBUG:
+                _clear_cached_obs(key)
 
     def reset_zoo_memory(self, episode_ids=None):
         """Drop cached observations (all episodes, or the given ones). Call at rollout
         boundaries so a new evaluation episode does not inherit the previous one."""
+        dropped = list(self.memory_pool) if episode_ids is None else list(episode_ids)
         if episode_ids is None:
             self.memory_pool.clear()
         else:
             for key in episode_ids:
                 self.memory_pool.pop(key, None)
+        if _MEM_DEBUG:
+            for key in dropped:
+                _clear_cached_obs(key)
 
 
     def process_backbone_output_zoo(
