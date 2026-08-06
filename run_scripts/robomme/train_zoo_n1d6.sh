@@ -106,6 +106,9 @@ ZOO_STEP_TAU="${ZOO_STEP_TAU:-0.15}"
 ZOO_DIST_TAU="${ZOO_DIST_TAU:-1.0}"
 ZOO_DENSITY_K="${ZOO_DENSITY_K:-4}"
 ZOO_DENSITY_TEMP="${ZOO_DENSITY_TEMP:-2.0}"
+# 1 = a candidate competes only within its temporal bucket (K-1 equal-width bins over the
+# episode so far), so no single phase can own the pool. 0 = original global-argmin eviction.
+ZOO_STRATIFIED="${ZOO_STRATIFIED:-1}"
 
 if [ "$MEMORY_MODE" = "zoo" ]; then
     if [ "$K" -lt 2 ]; then
@@ -126,6 +129,7 @@ MOMENT_ARGS=()
 if [ "$FREEZE_MOMENT_TOKENS" = "1" ]; then MOMENT_ARGS+=(--freeze-moment-tokens); else MOMENT_ARGS+=(--no-freeze-moment-tokens); fi
 if [ "$USE_KEY_MOMENT_GATE" = "1" ]; then MOMENT_ARGS+=(--use-key-moment-gate); else MOMENT_ARGS+=(--no-use-key-moment-gate); fi
 MOMENT_ARGS+=(--delta-threshold "$DELTA_THRESHOLD")
+if [ "$ZOO_STRATIFIED" = "1" ]; then MOMENT_ARGS+=(--zoo-stratified); else MOMENT_ARGS+=(--no-zoo-stratified); fi
 [ -n "$LOAD_MOMENT_TOKENS_FROM" ] && MOMENT_ARGS+=(--load-moment-tokens-from "$LOAD_MOMENT_TOKENS_FROM")
 if [ "$SEQUENTIAL_ANCHORS" = "1" ]; then
     MOMENT_ARGS+=(--sequential-anchors --anchor-stride "$ANCHOR_STRIDE")
