@@ -588,6 +588,10 @@ class Gr00tN1d6ActionHead(nn.Module):
             # block of mem_seq, so admitting it here would put it in twice.
             if pool["staged"] is not None:
                 s_tok, s_a, s_step = pool["staged"]
+                if self.config.zoo_stratified:
+                    raise ValueError(
+                        "zoo_stratified is not supported in this version. Please set zoo_stratified to False."
+                    )
                 admit = (
                     self.admit_stratified
                     if getattr(self.config, "zoo_stratified", True)
