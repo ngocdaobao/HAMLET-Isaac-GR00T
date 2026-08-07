@@ -643,7 +643,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                 print(
                     f"[mem] pool ep={key} restart={restart} step={step_id} "
                     f"admitted={admitted} pool={len(pool['tokens'])}/{cap} "
-                    f"bins={occupied}/{cap} uniq_blocks={uniq}/{K_target} "
+                    f"uniq_blocks={uniq}/{K_target} "
                     f"steps={sorted(pool['step_ids'])}",
                     flush=True,
                 )
