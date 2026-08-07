@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # GR00T N1.6 + HAMLET "zoo" fine-tune -- history-aware policy with a cross-iteration
 # memory pool instead of a within-batch memory window.
-# Usage: VIZ_BATCH_DIR=runs/robomme DATASET_PATH=data/robomme bash run_scripts/robomme/train_zoo_n1d6.sh
+# Usage: VIZ_BATCH_DIR=runs/robomme DATASET_PATH=data/robomme bash run_scripts/robomme/train_zoo_n1d6_short_mem_no_bucket.sh
 #   RoboMME modality (8-D abs-joint / 2-view) is preset (robomme_config.py).
 #
 # How zoo differs from the original HAMLET window (--memory-mode window):
