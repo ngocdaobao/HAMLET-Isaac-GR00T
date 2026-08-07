@@ -33,7 +33,7 @@ cd "$REPO_ROOT"
 # FFmpeg 7 libs *before* python starts -- otherwise `import torchcodec` raises at load
 # time and every dataloader worker silently falls back to a slower decoder backend.
 # Sourced (not executed) so torchrun and its forked workers inherit the environment.
-source "$REPO_ROOT/torchcodec_setup.sh"
+# source "$REPO_ROOT/torchcodec_setup.sh"
 
 # config (override via env)
 DATASET_PATH="${DATASET_PATH:?set DATASET_PATH to your benchmark dataset directory}"
