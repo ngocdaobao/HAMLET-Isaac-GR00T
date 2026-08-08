@@ -176,7 +176,6 @@ offline_open_loop_eval_plots/
 
 # Ckpt
 runs/
-upload_ckpt.py
 
 # Run
 /wandb
