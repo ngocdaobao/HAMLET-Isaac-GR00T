@@ -565,7 +565,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                 # `first_step` anchors the temporal bucket boundaries; `key` lets the
                 # admission helpers drop the debug frame of whatever they evict.
                 pool = {"tokens": [], "step_ids": [], "attn": [],
-                        "staged": None, "last_step": None,
+                        "recent": None, "staged": None, "last_step": None,
                         "first_step": None, "key": key}
                 self.memory_pool[key] = pool
                 if _MEM_DEBUG:
@@ -575,17 +575,20 @@ class Gr00tN1d6ActionHead(nn.Module):
             a = attn_score[idx]
             pool["last_step"] = step
             step_id = self._zoo_tick if step is None else step
-            # The pool holds PAST blocks only -- mem_seq is `past + [current]` and must
-            # come to exactly K_target blocks, so the pool caps at K_target - 1.
-            cap = K_target - 1
+            # mem_seq is `past + [recent] + [current]` and must come to exactly
+            # K_target blocks. Two of them are reserved -- the live observation and the
+            # one immediately before it -- so the selected history pool caps at
+            # K_target - 2. Reserving recency means the selector never has to spend a
+            # slot on the last step just to keep short-horizon continuity.
+            cap = max(K_target - 2, 0)
             admitted = None
             if pool["first_step"] is None:
                 pool["first_step"] = step_id
 
-            # The frame staged on the previous call is judged now. Deferring by one step
-            # is what lets the current observation always be cached without duplicating
-            # it: while a frame is staged it already reaches the model as the live last
-            # block of mem_seq, so admitting it here would put it in twice.
+            # Blocks reach the pool two steps late: at step t the staged frame is t-2,
+            # because t-1 is still occupying the reserved recency slot and t is live.
+            # Judging a block only once it has left both reserved slots is what keeps it
+            # from appearing in mem_seq twice.
             if pool["staged"] is not None:
                 s_tok, s_a, s_step = pool["staged"]
                 if self.config.zoo_stratified:
@@ -600,11 +603,16 @@ class Gr00tN1d6ActionHead(nn.Module):
                 admitted = admit(pool, (s_tok, s_a, s_step), cap)
                 if _MEM_DEBUG and admitted is None:
                     _drop_cached_obs(key, s_step)
-       
 
-            # Always cache the current observation. It competes for a pool slot on the
-            # next call; this step it reaches the model as the live mem_seq block.
-            pool["staged"] = (current[idx].detach(), a, step_id)
+            # Shift the reserved slots by one: the block that held recency (t-1) becomes
+            # the staged candidate judged on the next call, and the current observation
+            # takes recency. At warm-up there is no predecessor, so the current block
+            # fills the recency slot too.
+            recent = pool.get("recent")
+            pool["staged"] = recent
+            pool["recent"] = (current[idx].detach(), a, step_id)
+            recent_tok = recent[0] if recent is not None else current[idx]
+            recent_id = recent[2] if recent is not None else step_id
             if _MEM_DEBUG:
                 # Dumped now rather than on admission: the staged frame is already one of
                 # the K blocks the model sees, and writing it here keeps the directory a
@@ -617,33 +625,38 @@ class Gr00tN1d6ActionHead(nn.Module):
             # must be re-sorted by their source step.
             order = sorted(range(len(pool["tokens"])), key=lambda i: pool["step_ids"][i])
             past = [pool["tokens"][i] for i in order]
-            if len(past) < K_target - 1:
+            if len(past) < cap:
                 # Warm-up: left-pad by repeating the oldest available block (or the
-                # current one when the pool is still empty).
-                oldest = past[0] if past else current[idx].detach()
-                past = [oldest] * (K_target - 1 - len(past)) + past
-            mem_seq.append(torch.stack(past + [current[idx]], dim=0))  # (K_target, n_q, d)
+                # recency one when the pool is still empty).
+                oldest = past[0] if past else recent_tok
+                past = [oldest] * (cap - len(past)) + past
+            # past (K-2, selected) -> recent (t-1) -> current (t), oldest-first.
+            tail = [recent_tok, current[idx]] if K_target >= 2 else [current[idx]]
+            mem_seq.append(torch.stack(past + tail, dim=0))  # (K_target, n_q, d)
 
             if _MEM_DEBUG:
                 # Same slots, same oldest-first order, same left-padding as `past` above,
                 # so the strip is a faithful picture of the blocks that were just stacked.
                 past_ids = [pool["step_ids"][i] for i in order]
-                if len(past_ids) < K_target - 1:
-                    oldest_id = past_ids[0] if past_ids else step_id
-                    past_ids = [oldest_id] * (K_target - 1 - len(past_ids)) + past_ids
+                if len(past_ids) < cap:
+                    oldest_id = past_ids[0] if past_ids else recent_id
+                    past_ids = [oldest_id] * (cap - len(past_ids)) + past_ids
+                if K_target >= 2:
+                    # The recency slot is a real block of mem_seq, so the strip shows it
+                    # between the pool and the outlined live frame.
+                    past_ids = past_ids + [recent_id]
                 _save_mem_strip(key, step_id, past_ids, getattr(self, "_debug_images", None), idx)
                 # Left-padding repeats the SAME tensor object, so counting distinct ids
                 # tells us how many of the K blocks are real history. uniq==1 means the
                 # pool is being reset every call and memory carries nothing.
-                uniq = len({id(t) for t in past} | {id(current[idx])})
-                # `steps` is the pool's temporal coverage and `buckets` is how many of
-                # the K-1 temporal bins it actually occupies: bins==pool means the pool
-                # is spread evenly over the episode so far, bins << pool means it has
-                # collapsed onto a few phases.
+                uniq = len({id(t) for t in past + tail})
+                # `steps` is the pool's temporal coverage over the K-2 selected slots:
+                # spread evenly means the pool covers the episode so far, clustered means
+                # it has collapsed onto a few phases. `recent` is the reserved t-1 slot.
                 print(
                     f"[mem] pool ep={key} restart={restart} step={step_id} "
                     f"admitted={admitted} pool={len(pool['tokens'])}/{cap} "
-                    f"uniq_blocks={uniq}/{K_target} "
+                    f"recent={recent_id} uniq_blocks={uniq}/{K_target} "
                     f"steps={sorted(pool['step_ids'])}",
                     flush=True,
                 )
