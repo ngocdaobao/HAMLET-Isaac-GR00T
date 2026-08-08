@@ -201,8 +201,10 @@ class FinetuneConfig:
 
     zoo_max_episodes: int = 4096
     """Cap on how many episodes the zoo pool keeps; least-recently-seen entries are
-    evicted. Each entry holds (memory_window-1) x n_moment_tokens x d activations.
-    At memory_window=12 that is ~176 KB/episode, so the default cap reserves ~720 MB. 
+    evicted. Each entry holds memory_window x n_moment_tokens x d activations (the
+    K-zoo_recent_slots selected blocks, the reserved recency queue, and the staged
+    candidate). At memory_window=12 that is ~192 KB/episode, so the default cap
+    reserves ~790 MB.
     Only a few x the per-rank batch size is ever in flight -- lower it accordingly."""
 
     zoo_density_weight: float = 0.5
@@ -239,10 +241,24 @@ class FinetuneConfig:
     sigma is 1/distance and therefore heavy-tailed, so at temp=1 a single pair of
     near-duplicate blocks saturates the term and every other block reads as 0."""
 
+    zoo_recent_slots: int = 2
+    """m: how many of the memory_window slots are reserved for the newest observations.
+
+    mem_seq is `selected(K-m) + recent(m-1) + [current]`, oldest-first: the last m blocks
+    are always the last m observations, verbatim, and only the leading K-m slots are
+    filled by the pool selector. Reserving recency keeps short-horizon continuity without
+    the selector having to spend slots on it -- the pool is then free to cover the rest
+    of the episode. Blocks become eligible for the pool m steps after they were current,
+    once they have left the reserved queue, so nothing appears in mem_seq twice.
+
+    m=1 is the original behavior (only the current observation is reserved).
+    m=memory_window turns the window into a plain FIFO of the last K observations.
+    Clamped to [1, memory_window] at runtime."""
+
     zoo_stratified: bool = True
     """How a staged block competes for a pool slot.
 
-    True: the pool's (memory_window - 1) slots are treated as equal-width temporal bins
+    True: the pool's (memory_window - zoo_recent_slots) slots are treated as equal-width temporal bins
     over the episode's elapsed span, and a candidate competes only with residents of its
     own bin -- so one phase cannot own more of the pool than its share of the timeline.
     When the pool is full and the candidate's bin is empty, the slot is taken from the

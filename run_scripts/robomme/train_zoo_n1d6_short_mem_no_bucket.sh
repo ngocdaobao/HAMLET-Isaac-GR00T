@@ -64,10 +64,12 @@ echo "[log] $LOG_FILE"
 
 # HAMLET memory options
 MEMORY_MODE="${MEMORY_MODE:-zoo}"             # zoo | window  (see header)
-# Memory-transformer sequence length T = pool target. The pool holds K-1 PAST
-# observations plus the current one. K=1 leaves no room for history at all, so zoo
-# needs K>=2; K=4 matches the HAMLET default window.
-K="${K:-5}"                                   # memory window = history length
+# Memory-transformer sequence length T = pool target. The window is
+# selected(K-M) + recent(M-1) + current: the trailing M slots always hold the M newest
+# observations and the pool selector fills the rest. K=1 leaves no room for history at
+# all, so zoo needs K>=2; K=4 matches the HAMLET default window.
+K="${K:-7}"                                   # memory window = history length
+ZOO_RECENT_SLOTS="${ZOO_RECENT_SLOTS:-4}"     # M: reserved recency slots (1 = current only, K = plain FIFO)
 ZOO_MAX_EPISODES="${ZOO_MAX_EPISODES:-4096}"  # LRU cap on how many episodes keep a pool
 MEMORY_STRIDE="${MEMORY_STRIDE:-16}"          # env steps between snapshots; set equal to the eval n_action_steps
 N_MOMENT_TOKENS="${N_MOMENT_TOKENS:-4}"       # moment tokens per step (n_q)
@@ -112,7 +114,11 @@ ZOO_STRATIFIED="${ZOO_STRATIFIED:-0}"
 
 if [ "$MEMORY_MODE" = "zoo" ]; then
     if [ "$K" -lt 2 ]; then
-        echo "[zoo] ERROR: K=$K leaves no room for history (pool holds K-1 past observations). Use K>=2." >&2
+        echo "[zoo] ERROR: K=$K leaves no room for history (the window holds K-1 past observations). Use K>=2." >&2
+        exit 1
+    fi
+    if [ "$ZOO_RECENT_SLOTS" -lt 1 ] || [ "$ZOO_RECENT_SLOTS" -gt "$K" ]; then
+        echo "[zoo] ERROR: ZOO_RECENT_SLOTS=$ZOO_RECENT_SLOTS must be in [1, K=$K]; it reserves the trailing M slots of the window, leaving K-M for the pool selector." >&2
         exit 1
     fi
     if [ "$SEQUENTIAL_ANCHORS" != "1" ]; then
@@ -149,7 +155,7 @@ fi
 echo "[cfg] host=$(hostname) commit=$(git rev-parse --short HEAD 2>/dev/null || echo n/a) dataset=$DATASET_PATH base_model=$BASE_MODEL"
 echo "[cfg] gpus=$NUM_GPUS batch=$GLOBAL_BATCH_SIZE grad_accum=$GRAD_ACCUM max_steps=$MAX_STEPS save_steps=$SAVE_STEPS"
 echo "[cfg] memory_mode=$MEMORY_MODE K=$K stride=$MEMORY_STRIDE n_moment=$N_MOMENT_TOKENS cond=$MEM_COND_TYPE type=$MEMORY_TYPE gate=$USE_KEY_MOMENT_GATE delta=$DELTA_THRESHOLD"
-echo "[cfg] zoo density_w=$ZOO_DENSITY_WEIGHT step_tau=$ZOO_STEP_TAU dist_tau=$ZOO_DIST_TAU density_k=$ZOO_DENSITY_K density_temp=$ZOO_DENSITY_TEMP max_episodes=$ZOO_MAX_EPISODES"
+echo "[cfg] zoo density_w=$ZOO_DENSITY_WEIGHT step_tau=$ZOO_STEP_TAU dist_tau=$ZOO_DIST_TAU density_k=$ZOO_DENSITY_K density_temp=$ZOO_DENSITY_TEMP max_episodes=$ZOO_MAX_EPISODES recent_slots=$ZOO_RECENT_SLOTS selected_slots=$((K - ZOO_RECENT_SLOTS))"
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 torchrun --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_PORT" \
@@ -175,4 +181,5 @@ torchrun --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_PORT" \
     --memory-type "$MEMORY_TYPE" \
     --memory-mode "$MEMORY_MODE" \
     --zoo-max-episodes "$ZOO_MAX_EPISODES" \
+    --zoo-recent-slots "$ZOO_RECENT_SLOTS" \
     "${MOMENT_ARGS[@]}"

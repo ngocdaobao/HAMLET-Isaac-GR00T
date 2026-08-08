@@ -103,6 +103,7 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                 zoo_density_k=self.config.model.zoo_density_k,
                 zoo_density_temp=self.config.model.zoo_density_temp,
                 zoo_stratified=self.config.model.zoo_stratified,
+                zoo_recent_slots=self.config.model.zoo_recent_slots,
             )
 
             # Initialize mask_tokens if they are not present in the base checkpoint

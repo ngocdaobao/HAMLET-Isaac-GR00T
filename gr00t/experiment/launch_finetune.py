@@ -115,6 +115,7 @@ if __name__ == "__main__":
     config.model.zoo_density_k = ft_config.zoo_density_k
     config.model.zoo_density_temp = ft_config.zoo_density_temp
     config.model.zoo_stratified = ft_config.zoo_stratified
+    config.model.zoo_recent_slots = ft_config.zoo_recent_slots
     config.model.use_key_moment_gate = ft_config.use_key_moment_gate
     config.model.delta_threshold = ft_config.delta_threshold
     if (
@@ -156,9 +157,18 @@ if __name__ == "__main__":
                 f"{ft_config.memory_stride}."
             )
             config.data.anchor_stride = ft_config.memory_stride
+        m = ft_config.zoo_recent_slots
+        if not 1 <= m <= ft_config.memory_window:
+            raise ValueError(
+                f"zoo_recent_slots={m} must be in [1, memory_window="
+                f"{ft_config.memory_window}]: it reserves the trailing m slots of the "
+                f"window for the newest observations, leaving memory_window - m for the "
+                f"pool selector."
+            )
         print(
             f"[HAMLET-ZOO] single-obs batching: delta_indices=[0] "
-            f"K_target={ft_config.memory_window} stride={ft_config.memory_stride}"
+            f"K_target={ft_config.memory_window} stride={ft_config.memory_stride} "
+            f"recent_slots={m} selected_slots={ft_config.memory_window - m}"
         )
     elif ft_config.hamlet_mode == "finetune" and ft_config.memory_window > 1:
         from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS

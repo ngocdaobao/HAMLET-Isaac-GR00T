@@ -136,6 +136,10 @@ class Gr00tN1d6Config(PretrainedConfig):
     zoo_dist_tau: float = 0.5  # how close in appearance counts as redundant
     zoo_density_k: int = 4  # kNN neighbourhood size for the density estimate
     zoo_density_temp: float = 2.0  # softmax temperature normalizing density over the pool
+    # m: trailing slots of the window reserved for the newest observations. mem_seq is
+    # selected(K-m) + recent(m-1) + [current], so only K-m slots are selector-filled.
+    # Persisted to the checkpoint config so evaluation assembles the same window.
+    zoo_recent_slots: int = 2
     # True: a candidate competes only with pool blocks in its own temporal bucket, so
     # coverage of the episode is structural. False: original global-argmin eviction.
     zoo_stratified: bool = True
