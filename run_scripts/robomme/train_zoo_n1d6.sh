@@ -38,7 +38,7 @@ cd "$REPO_ROOT"
 # config (override via env)
 DATASET_PATH="${DATASET_PATH:?set DATASET_PATH to your benchmark dataset directory}"
 MODALITY_CONFIG="${MODALITY_CONFIG:-gr00t/configs/data/robomme_config.py}"  # robomme_config.py | rmbench_config.py
-OUTPUT_DIR="${OUTPUT_DIR:-runs/robomme/zoo_n1d6_pool}"
+OUTPUT_DIR="${OUTPUT_DIR:-runs/robomme/zoo_n1d6_hamlet_sequential}"
 BASE_MODEL="${BASE_MODEL:-ckpt/gr00t_n1d6}"
 NUM_GPUS="${NUM_GPUS:-4}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"

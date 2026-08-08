@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # GR00T N1.6 + HAMLET "zoo" fine-tune -- history-aware policy with a cross-iteration
 # memory pool instead of a within-batch memory window.
-# Usage: VIZ_BATCH_DIR=runs/robomme DATASET_PATH=data/robomme bash run_scripts/robomme/train_zoo_n1d6_short_mem_no_bucket.sh
+# Usage: VIZ_BATCH_DIR=runs/robomme DATASET_PATH=data/robomme bash run_scripts/robomme/train_zoo_n1d6_hamlet_sequential.sh
 #   RoboMME modality (8-D abs-joint / 2-view) is preset (robomme_config.py).
 #
 # How zoo differs from the original HAMLET window (--memory-mode window):
@@ -38,7 +38,7 @@ cd "$REPO_ROOT"
 # config (override via env)
 DATASET_PATH="${DATASET_PATH:?set DATASET_PATH to your benchmark dataset directory}"
 MODALITY_CONFIG="${MODALITY_CONFIG:-gr00t/configs/data/robomme_config.py}"  # robomme_config.py | rmbench_config.py
-OUTPUT_DIR="${OUTPUT_DIR:-runs/robomme/zoo_n1d6_pool_2short_mem}"
+OUTPUT_DIR="${OUTPUT_DIR:-runs/robomme/zoo_n1d6_pool_hamlet_sequential}"  # where to save checkpoints and logs
 BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.6-3B}"
 NUM_GPUS="${NUM_GPUS:-4}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
@@ -68,7 +68,7 @@ MEMORY_MODE="${MEMORY_MODE:-zoo}"             # zoo | window  (see header)
 # selected(K-M) + recent(M-1) + current: the trailing M slots always hold the M newest
 # observations and the pool selector fills the rest. K=1 leaves no room for history at
 # all, so zoo needs K>=2; K=4 matches the HAMLET default window.
-K="${K:-7}"                                   # memory window = history length
+K="${K:-4}"                                   # memory window = history length
 ZOO_RECENT_SLOTS="${ZOO_RECENT_SLOTS:-4}"     # M: reserved recency slots (1 = current only, K = plain FIFO)
 ZOO_MAX_EPISODES="${ZOO_MAX_EPISODES:-4096}"  # LRU cap on how many episodes keep a pool
 MEMORY_STRIDE="${MEMORY_STRIDE:-16}"          # env steps between snapshots; set equal to the eval n_action_steps
@@ -78,7 +78,7 @@ MEMORY_TYPE="${MEMORY_TYPE:-moment_token}"    # moment_token | vision_feature
 LOAD_MOMENT_TOKENS_FROM="${LOAD_MOMENT_TOKENS_FROM:-}"  # optional Stage-1 (TCL) ckpt; see README "Moment-token initialization"
 FREEZE_MOMENT_TOKENS="${FREEZE_MOMENT_TOKENS:-0}"       # 1 = freeze moment tokens (paper recipe when TCL-initialized)
 USE_KEY_MOMENT_GATE="${USE_KEY_MOMENT_GATE:-1}"        # 1 = zero memory on non-key-moment steps; 0 = plain HAMLET. Saved to checkpoint config -> eval inherits it.
-DELTA_THRESHOLD="${DELTA_THRESHOLD:-0.4}"              # key-moment threshold on normalized-joint window-end delta (only used when gate on)
+DELTA_THRESHOLD="${DELTA_THRESHOLD:-100.0}"              # key-moment threshold on normalized-joint window-end delta (only used when gate on)
 # Anchor ordering. SEQUENTIAL_ANCHORS=1 marches each batch slot forward through one
 # demonstration: slot i at iteration t+1 holds the next anchor of the same episode it
 # held at iteration t, so a (B, d) state cache stays row-aligned across iterations.
