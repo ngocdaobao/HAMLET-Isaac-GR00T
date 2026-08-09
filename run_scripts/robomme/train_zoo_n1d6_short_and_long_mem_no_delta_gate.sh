@@ -43,7 +43,7 @@ source "$REPO_ROOT/torchcodec_setup.sh"
 DATASET_PATH="${DATASET_PATH:?set DATASET_PATH to your benchmark dataset directory}"
 MODALITY_CONFIG="${MODALITY_CONFIG:-gr00t/configs/data/robomme_config.py}"  # robomme_config.py | rmbench_config.py
 OUTPUT_DIR="${OUTPUT_DIR:-runs/robomme/zoo_n1d6_pool_short_and_long_mem_no_delta_gate}"  # where to save checkpoints and logs
-BASE_MODEL="${BASE_MODEL:-ckpt/gr00t_n1d6}"
+BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.6-3B}"  # ckpt/gr00t_n1d6 | nvidia/GR00T-N1.6-3B
 NUM_GPUS="${NUM_GPUS:-4}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-128}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"                  # zoo forwards 1 obs/row regardless of K, so this need not scale with K
