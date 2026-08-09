@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # GR00T N1.6 + HAMLET "zoo" fine-tune -- history-aware policy with a cross-iteration
 # memory pool instead of a within-batch memory window.
-# Usage: VIZ_BATCH_DIR=runs/robomme _MEM_DEBUG=0 DATASET_PATH=data/robomme bash run_scripts/robomme/train_zoo_n1d6_short_mem.sh
+# Usage: VIZ_BATCH_DIR=runs/robomme _MEM_DEBUG=0 DATASET_PATH=data/robomme bash run_scripts/robomme/train_zoo_n1d6_short_and_long_mem_no_delta_gate.sh
 #   RoboMME modality (8-D abs-joint / 2-view) is preset (robomme_config.py).
 #
 # How zoo differs from the original HAMLET window (--memory-mode window):
@@ -42,10 +42,10 @@ source "$REPO_ROOT/torchcodec_setup.sh"
 # config (override via env)
 DATASET_PATH="${DATASET_PATH:?set DATASET_PATH to your benchmark dataset directory}"
 MODALITY_CONFIG="${MODALITY_CONFIG:-gr00t/configs/data/robomme_config.py}"  # robomme_config.py | rmbench_config.py
-OUTPUT_DIR="${OUTPUT_DIR:-runs/robomme/zoo_n1d6_pool_short_mem}"
+OUTPUT_DIR="${OUTPUT_DIR:-runs/robomme/zoo_n1d6_pool_short_and_long_mem_no_delta_gate}"  # where to save checkpoints and logs
 BASE_MODEL="${BASE_MODEL:-ckpt/gr00t_n1d6}"
 NUM_GPUS="${NUM_GPUS:-4}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-128}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"                  # zoo forwards 1 obs/row regardless of K, so this need not scale with K
 MAX_STEPS="${MAX_STEPS:-60000}"
 SAVE_STEPS="${SAVE_STEPS:-60000}"
@@ -71,7 +71,7 @@ MEMORY_MODE="${MEMORY_MODE:-zoo}"             # zoo | window  (see header)
 # Memory-transformer sequence length T = pool target. The pool holds K-1 PAST
 # observations plus the current one. K=1 leaves no room for history at all, so zoo
 # needs K>=2; K=4 matches the HAMLET default window.
-K="${K:-5}"                                   # memory window = history length
+K="${K:-8}"                                   # memory window = history length
 ZOO_MAX_EPISODES="${ZOO_MAX_EPISODES:-4096}"  # LRU cap on how many episodes keep a pool
 MEMORY_STRIDE="${MEMORY_STRIDE:-16}"          # env steps between snapshots; set equal to the eval n_action_steps
 N_MOMENT_TOKENS="${N_MOMENT_TOKENS:-4}"       # moment tokens per step (n_q)
@@ -80,7 +80,7 @@ MEMORY_TYPE="${MEMORY_TYPE:-moment_token}"    # moment_token | vision_feature
 LOAD_MOMENT_TOKENS_FROM="${LOAD_MOMENT_TOKENS_FROM:-}"  # optional Stage-1 (TCL) ckpt; see README "Moment-token initialization"
 FREEZE_MOMENT_TOKENS="${FREEZE_MOMENT_TOKENS:-0}"       # 1 = freeze moment tokens (paper recipe when TCL-initialized)
 USE_KEY_MOMENT_GATE="${USE_KEY_MOMENT_GATE:-1}"        # 1 = zero memory on non-key-moment steps; 0 = plain HAMLET. Saved to checkpoint config -> eval inherits it.
-DELTA_THRESHOLD="${DELTA_THRESHOLD:-0.4}"              # key-moment threshold on normalized-joint window-end delta (only used when gate on)
+DELTA_THRESHOLD="${DELTA_THRESHOLD:-100.0}"              # key-moment threshold on normalized-joint window-end delta (only used when gate on)
 # Anchor ordering. SEQUENTIAL_ANCHORS=1 marches each batch slot forward through one
 # demonstration: slot i at iteration t+1 holds the next anchor of the same episode it
 # held at iteration t, so a (B, d) state cache stays row-aligned across iterations.
@@ -112,7 +112,7 @@ ZOO_DENSITY_K="${ZOO_DENSITY_K:-4}"
 ZOO_DENSITY_TEMP="${ZOO_DENSITY_TEMP:-2.0}"
 # 1 = a candidate competes only within its temporal bucket (K-1 equal-width bins over the
 # episode so far), so no single phase can own the pool. 0 = original global-argmin eviction.
-ZOO_STRATIFIED="${ZOO_STRATIFIED:-1}"
+ZOO_STRATIFIED="${ZOO_STRATIFIED:-0}"
 
 if [ "$MEMORY_MODE" = "zoo" ]; then
     if [ "$K" -lt 2 ]; then
