@@ -40,11 +40,11 @@ DATASET_PATH="${DATASET_PATH:?set DATASET_PATH to your benchmark dataset directo
 MODALITY_CONFIG="${MODALITY_CONFIG:-gr00t/configs/data/robomme_config.py}"  # robomme_config.py | rmbench_config.py
 OUTPUT_DIR="${OUTPUT_DIR:-runs/robomme/zoo_n1d6_fix_dataloader}"  # where to save checkpoints and logs
 BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.6-3B}"
-NUM_GPUS="${NUM_GPUS:-1}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-2}"
+NUM_GPUS="${NUM_GPUS:-4}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"                  # zoo forwards 1 obs/row regardless of K, so this need not scale with K
-MAX_STEPS="${MAX_STEPS:-60}"
-SAVE_STEPS="${SAVE_STEPS:-60}"
+MAX_STEPS="${MAX_STEPS:-60000}"
+SAVE_STEPS="${SAVE_STEPS:-60000}"
 MASTER_PORT="${MASTER_PORT:-$(( 20000 + RANDOM % 10000 ))}"
 
 # The compute nodes have no outbound network, so wandb cannot be the run record --
@@ -70,7 +70,7 @@ MEMORY_MODE="${MEMORY_MODE:-zoo}"             # zoo | window  (see header)
 # all, so zoo needs K>=2; K=4 matches the HAMLET default window.
 K="${K:-13}"                                   # memory window = history length
 ZOO_RECENT_SLOTS="${ZOO_RECENT_SLOTS:-4}"     # M: reserved recency slots (1 = current only, K = plain FIFO)
-ZOO_MAX_EPISODES="${ZOO_MAX_EPISODES:-10000}"  # LRU cap on how many episodes keep a pool
+ZOO_MAX_EPISODES="${ZOO_MAX_EPISODES:-50000}"  # LRU cap on how many episodes keep a pool
 MEMORY_STRIDE="${MEMORY_STRIDE:-16}"          # env steps between snapshots; set equal to the eval n_action_steps
 N_MOMENT_TOKENS="${N_MOMENT_TOKENS:-4}"       # moment tokens per step (n_q)
 MEM_COND_TYPE="${MEM_COND_TYPE:-cross_attn}"  # cross_attn | adaln
@@ -160,7 +160,7 @@ echo "[cfg] gpus=$NUM_GPUS batch=$GLOBAL_BATCH_SIZE grad_accum=$GRAD_ACCUM max_s
 echo "[cfg] memory_mode=$MEMORY_MODE K=$K stride=$MEMORY_STRIDE n_moment=$N_MOMENT_TOKENS cond=$MEM_COND_TYPE type=$MEMORY_TYPE gate=$USE_KEY_MOMENT_GATE delta=$DELTA_THRESHOLD"
 echo "[cfg] zoo density_w=$ZOO_DENSITY_WEIGHT step_tau=$ZOO_STEP_TAU dist_tau=$ZOO_DIST_TAU density_k=$ZOO_DENSITY_K density_temp=$ZOO_DENSITY_TEMP max_episodes=$ZOO_MAX_EPISODES recent_slots=$ZOO_RECENT_SLOTS selected_slots=$((K - ZOO_RECENT_SLOTS))"
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 torchrun --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_PORT" \
     gr00t/experiment/launch_finetune.py \
     --base-model-path "$BASE_MODEL" \
