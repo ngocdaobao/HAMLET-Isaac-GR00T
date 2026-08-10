@@ -38,13 +38,20 @@ class Gr00tN1d6TCLHead(nn.Module):
             nn.SiLU(),
             nn.Linear(d, d),
         )
+        self.reset_parameters()
+        self.tcl_tau = tcl_tau
+        self.mask_token = None  # stub for trainer compatibility
+        self._debug_dumped = False
+
+    def reset_parameters(self):
+        """Initialize the projection MLP. Safe to call after `from_pretrained`, which
+        leaves these as missing keys materialized from `torch.empty` (usually all-zero
+        pages -> z == 0 -> constant loss = ln 2 and exactly zero gradients)."""
         for m in self.moment_to_repr.modules():
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, mean=0.0, std=0.02)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        self.tcl_tau = tcl_tau
-        self.mask_token = None  # stub for trainer compatibility
 
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
@@ -56,17 +63,26 @@ class Gr00tN1d6TCLHead(nn.Module):
     def set_frozen_modules_to_eval_mode(self):
         pass
 
-    def _moment_repr(self, backbone_output: BatchFeature) -> torch.Tensor:
-        """Mean-pool the n_q moment-token tail, project, L2-normalize -> (B, d)."""
+    def _moment_repr(self, backbone_output: BatchFeature) -> tuple[torch.Tensor, dict]:
+        """Mean-pool the n_q moment-token tail, project, L2-normalize -> (B, d).
+
+        Also returns the pre-normalization magnitudes: a dead head (all-zero projection
+        weights, or a backbone tail that never varies) is invisible in the loss but shows
+        up immediately as ``repr_norm == 0``.
+        """
         feats = backbone_output["backbone_features"]  # (B, T, d)
         n_q = int(backbone_output["n_moment_tokens"])
         mq = feats[:, -n_q:, :]
         pooled = mq.mean(dim=1)
         # Cast to the projection MLP's dtype for autocast cleanliness.
         proj_dtype = next(self.moment_to_repr.parameters()).dtype
-        z = self.moment_to_repr(pooled.to(proj_dtype))
-        z = F.normalize(z, dim=-1, eps=1e-8)
-        return z
+        h = self.moment_to_repr(pooled.to(proj_dtype))
+        z = F.normalize(h, dim=-1, eps=1e-8)
+        stats = {
+            "pooled_norm": pooled.detach().float().norm(dim=-1).mean(),
+            "repr_norm": h.detach().float().norm(dim=-1).mean(),
+        }
+        return z, stats
 
     def forward(
         self,
@@ -75,9 +91,13 @@ class Gr00tN1d6TCLHead(nn.Module):
         neg_output: BatchFeature,
         action_input: BatchFeature,
     ) -> dict:
-        z_a = self._moment_repr(anchor_output)
-        z_p = self._moment_repr(aug_output)
-        z_n = self._moment_repr(neg_output)
+        z_a, st_a = self._moment_repr(anchor_output)
+        z_p, st_p = self._moment_repr(aug_output)
+        z_n, st_n = self._moment_repr(neg_output)
+
+        if not self._debug_dumped:
+            self._debug_dumped = True
+            self._dump_debug(anchor_output, aug_output, neg_output, (st_a, st_p, st_n))
 
         sim_ap = torch.sum(z_a * z_p, dim=-1, keepdim=True)  # (B, 1)
         sim_an = torch.sum(z_a * z_n, dim=-1, keepdim=True)  # (B, 1)
@@ -88,12 +108,49 @@ class Gr00tN1d6TCLHead(nn.Module):
         with torch.no_grad():
             tcl_pos_sim = sim_ap.mean()
             tcl_neg_sim = sim_an.mean()
+            tcl_repr_norm = torch.stack([st_a["repr_norm"], st_p["repr_norm"], st_n["repr_norm"]]).mean()
 
         return {
             "loss": loss,
             "tcl_pos_sim": tcl_pos_sim.detach(),
             "tcl_neg_sim": tcl_neg_sim.detach(),
+            "tcl_repr_norm": tcl_repr_norm.detach(),
         }
+
+    @torch.no_grad()
+    def _dump_debug(self, anchor_output, aug_output, neg_output, stats) -> None:
+        """One-shot dump on the first forward: tells apart the three ways this stage dies
+        (dead projection, identical anchor/aug/neg streams, dead moment-token tail)."""
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+                return
+        except Exception:
+            pass
+
+        lines = ["[TCL-DEBUG] first forward:"]
+        for i, m in enumerate(self.moment_to_repr):
+            if isinstance(m, nn.Linear):
+                lines.append(
+                    f"  moment_to_repr[{i}]: |W|={m.weight.detach().float().abs().max().item():.3e} "
+                    f"|b|={m.bias.detach().float().abs().max().item():.3e}"
+                )
+        for name, out, st in zip(("anchor", "aug", "neg"), (anchor_output, aug_output, neg_output), stats):
+            feats = out["backbone_features"]
+            n_q = int(out["n_moment_tokens"])
+            tail = feats[:, -n_q:, :].detach().float()
+            lines.append(
+                f"  {name}: feats={tuple(feats.shape)} n_q={n_q} "
+                f"tail|mu|={tail.abs().mean().item():.3e} tail_std={tail.std().item():.3e} "
+                f"pooled_norm={st['pooled_norm'].item():.3e} repr_norm={st['repr_norm'].item():.3e}"
+            )
+        a = anchor_output["backbone_features"].detach().float()
+        for name, out in (("aug", aug_output), ("neg", neg_output)):
+            b = out["backbone_features"].detach().float()
+            same = a.shape == b.shape and torch.equal(a, b)
+            lines.append(f"  anchor vs {name} backbone_features identical: {same}")
+        logger.warning("\n".join(lines))
 
     @torch.no_grad()
     def get_action(self, *args, **kwargs):

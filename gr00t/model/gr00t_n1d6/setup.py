@@ -139,12 +139,13 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                             if "norm" in n:
                                 p.data.fill_(1.0)
                     if (
-                        getattr(model.action_head, "moment_to_repr", None) is not None
+                        self.config.model.hamlet_mode == "tcl"
+                        and getattr(model.action_head, "moment_to_repr", None) is not None
                         and any("moment_to_repr" in k for k in tolerated_missing)
                     ):
-                        for m in model.action_head.moment_to_repr.modules():
-                            if isinstance(m, torch.nn.Linear):
-                                m.weight.data.normal_(mean=0.0, std=0.02)
+                        # TCL head only: reset_parameters covers biases too — leaving them
+                        # as torch.empty memory is what makes the head start (and stay) dead.
+                        model.action_head.reset_parameters()
                     if (
                         getattr(model.action_head, "mem_adaln_pool", None) is not None
                         and any("mem_adaln_pool" in k for k in tolerated_missing)

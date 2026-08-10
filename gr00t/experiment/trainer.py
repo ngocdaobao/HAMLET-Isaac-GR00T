@@ -313,11 +313,26 @@ class Gr00tTrainer(Trainer):
             and model.training
             and "tcl_pos_sim" in outputs
         ):
-            sims = torch.stack([outputs["tcl_pos_sim"], outputs["tcl_neg_sim"]]).to(loss.device)
-            sims = self._nested_gather(sims).view(-1, 2).mean(dim=0)
+            sims = torch.stack(
+                [
+                    outputs["tcl_pos_sim"],
+                    outputs["tcl_neg_sim"],
+                    outputs.get("tcl_repr_norm", torch.zeros_like(outputs["tcl_pos_sim"])),
+                ]
+            ).to(loss.device)
+            sims = self._nested_gather(sims).view(-1, 3).mean(dim=0)
             if self.args.local_rank in (-1, 0):
-                pos, neg = sims[0].item(), sims[1].item()
-                self.log({"tcl_pos_sim": pos, "tcl_neg_sim": neg, "tcl_sim_gap": pos - neg})
+                pos, neg, repr_norm = sims[0].item(), sims[1].item(), sims[2].item()
+                self.log(
+                    {
+                        "tcl_pos_sim": pos,
+                        "tcl_neg_sim": neg,
+                        "tcl_sim_gap": pos - neg,
+                        # ~0 means the projection output is dead (zero weights) rather than
+                        # merely uninformative; sims alone cannot distinguish the two.
+                        "tcl_repr_norm": repr_norm,
+                    }
+                )
 
         # --------------------------------------------------------------
         # Accuracy calculation
