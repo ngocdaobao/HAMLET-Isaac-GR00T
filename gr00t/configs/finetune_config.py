@@ -90,7 +90,7 @@ class FinetuneConfig:
     global_batch_size: int = 64
     """Total effective batch size across all GPUs and accumulation steps."""
 
-    dataloader_num_workers: int = 2
+    dataloader_num_workers: int = 4
     """Number of parallel worker processes used for data loading."""
 
     learning_rate: float = 1e-4
