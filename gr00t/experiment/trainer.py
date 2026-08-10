@@ -303,6 +303,23 @@ class Gr00tTrainer(Trainer):
         self.loss = loss
 
         # --------------------------------------------------------------
+        # HAMLET Stage-1 (TCL) diagnostics
+        # --------------------------------------------------------------
+        # The TCL loss saturates to ~0 as soon as the positive/negative cosine gap
+        # exceeds ~0.7 (tau=0.07), so the logged loss alone cannot tell a healthy run
+        # from a dead one. Surface the raw similarities instead.
+        if (
+            self.state.global_step % self.args.logging_steps == 0
+            and model.training
+            and "tcl_pos_sim" in outputs
+        ):
+            sims = torch.stack([outputs["tcl_pos_sim"], outputs["tcl_neg_sim"]]).to(loss.device)
+            sims = self._nested_gather(sims).view(-1, 2).mean(dim=0)
+            if self.args.local_rank in (-1, 0):
+                pos, neg = sims[0].item(), sims[1].item()
+                self.log({"tcl_pos_sim": pos, "tcl_neg_sim": neg, "tcl_sim_gap": pos - neg})
+
+        # --------------------------------------------------------------
         # Accuracy calculation
         # --------------------------------------------------------------
         if (

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # GR00T N1.6 + HAMLET fine-tune -- turn the VLA into a history-aware policy.
-# Usage: DATASET_PATH=/path/to/robomme bash run_scripts/robomme/train_hamlet_n1d6_tcl.sh
+# Usage: DATASET_PATH=data/robomme bash run_scripts/robomme/train_hamlet_n1d6_tcl.sh
 #   RoboMME modality (8-D abs-joint / 2-view) is preset (robomme_config.py).
 #   For the memory window K=8, also set GRAD_ACCUM=2 to offset the ~2x activation memory.
 #
@@ -19,8 +19,8 @@ BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.6-3B}"
 NUM_GPUS="${NUM_GPUS:-4}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"                  # set 2 for K=8 (offsets ~2x memory; keeps effective batch)
-MAX_STEPS="${MAX_STEPS:-60000}"
-SAVE_STEPS="${SAVE_STEPS:-30000}"
+MAX_STEPS="${MAX_STEPS:-3000}"
+SAVE_STEPS="${SAVE_STEPS:-3000}"
 MASTER_PORT="${MASTER_PORT:-$(( 20000 + RANDOM % 10000 ))}"
 
 # HAMLET memory options
