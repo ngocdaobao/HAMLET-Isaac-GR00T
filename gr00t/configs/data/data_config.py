@@ -63,6 +63,16 @@ class DataConfig:
     # Correlates gradients heavily -- see run_scripts README before enabling.
     sequential_anchors: bool = False
     anchor_stride: int = 1
+    # Sequential mode only: length (in anchors) of the contiguous runs each episode is
+    # cut into. Every run becomes its own virtual episode and the runs are shuffled, so
+    # a batch mixes task phases instead of marching all slots through step 0, 1, 2, ...
+    # together. 0 = no chunking (one run per phase stream).
+    anchor_chunk_size: int = 0
+    # Sequential mode only: how many of the `anchor_stride` phase offsets to sample.
+    # Offset o gives the anchor stream o, o+N, o+2N, ... -- just as valid as offset 0's
+    # and equally spaced -- so P offsets recover P/N of the anchors the stride discards,
+    # each as its own virtual episode. 1 = offset 0 only; <=0 = all N (nothing dropped).
+    anchor_phases: int = 1
 
     # Override statistics from the pretrained checkpoint
     override_pretraining_statistics: bool = False

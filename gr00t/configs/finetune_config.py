@@ -153,6 +153,25 @@ class FinetuneConfig:
     """Keep every Nth anchor. Set to memory_stride to match the inference snapshot spacing.
     Reduces the anchor count by ~N."""
 
+    anchor_chunk_size: int = 0
+    """Sequential mode only: cut each episode into contiguous runs of this many anchors,
+    treat every run as its own episode (own memory/state cache key) and shuffle the runs.
+    Without it every batch slot marches from step 0 in lockstep, so iteration t only ever
+    shows states from phase t of the task; with it a batch mixes phases while each slot
+    still walks forward in time. Costs a memory warm-up at every chunk boundary, so the
+    chunk should be at least a couple of memory windows long.
+    0 = auto: 2 * memory_window when sequential anchors are on, off otherwise.
+    Negative = force off (one contiguous run per phase stream)."""
+
+    anchor_phases: int = 3
+    """Sequential mode only: how many of the `anchor_stride` phase offsets to sample.
+    The stride keeps anchors 0, N, 2N, ... and throws the rest away, but offset o gives
+    the equally valid, equally spaced stream o, o+N, o+2N, ..., so P offsets recover P/N
+    of the discarded anchors -- each as its own virtual episode with its own memory pool.
+    P = anchor_stride (or <=0) uses every frame of every episode and multiplies the shard
+    count, and so the epoch length, by N. Offsets are spread evenly over [0, N), so
+    neighbouring near-duplicate frames are only both used at large P."""
+
     skip_weight_loading: bool = False
     """If True, skip loading model weights from base_model_path (architecture only).
     Useful for CI/testing to skip the slow checkpoint shard loading."""

@@ -96,6 +96,8 @@ if __name__ == "__main__":
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
     config.data.sequential_anchors = ft_config.sequential_anchors
     config.data.anchor_stride = ft_config.anchor_stride
+    config.data.anchor_chunk_size = ft_config.anchor_chunk_size
+    config.data.anchor_phases = ft_config.anchor_phases
 
     config.training.skip_weight_loading = ft_config.skip_weight_loading
 
@@ -189,5 +191,32 @@ if __name__ == "__main__":
                 MODALITY_CONFIGS[tag]["video"].delta_indices = new_indices
         config.data.allow_padding = True
         print(f"[HAMLET-TCL] video delta_indices = {new_indices}")
+
+    # Resolve anchor chunking last: the zoo branch above can force sequential anchors on,
+    # and chunking is a no-op without them.
+    if config.data.sequential_anchors:
+        if ft_config.anchor_chunk_size == 0:
+            config.data.anchor_chunk_size = 2 * ft_config.memory_window
+        elif ft_config.anchor_chunk_size < 0:
+            config.data.anchor_chunk_size = 0
+        if config.data.anchor_chunk_size > 0:
+            print(
+                f"[HAMLET] anchor chunking: {config.data.anchor_chunk_size} anchors per virtual "
+                f"episode (memory_window={ft_config.memory_window}); chunks are shuffled, anchors "
+                f"inside a chunk stay sequential."
+            ) 
+        else:
+            print("[HAMLET] anchor chunking disabled: one contiguous anchor run per episode.")
+
+        phases = config.data.anchor_stride if ft_config.anchor_phases <= 0 else ft_config.anchor_phases
+        phases = min(phases, config.data.anchor_stride)
+        config.data.anchor_phases = phases
+        if phases > 1:
+            print(
+                f"[HAMLET] anchor phases: {phases} of stride {config.data.anchor_stride} "
+                f"({phases}/{config.data.anchor_stride} of every episode's frames are used as "
+                f"anchors, each offset as its own virtual episode) -> ~{phases}x the shards, "
+                f"so an epoch is ~{phases}x longer."
+            )
 
     run(config)

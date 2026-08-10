@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # GR00T N1.6 + HAMLET "zoo" fine-tune -- history-aware policy with a cross-iteration
 # memory pool instead of a within-batch memory window.
-# Usage: VIZ_BATCH_DIR=runs/robomme _MEM_DEBUG=0 DATASET_PATH=data/robomme bash run_scripts/robomme/train_zoo_n1d6.sh
+# Usage: VIZ_BATCH_DIR=runs/robomme DATASET_PATH=data/robomme bash run_scripts/robomme/train_zoo_n1d6_hamlet_sequential.sh
 #   RoboMME modality (8-D abs-joint / 2-view) is preset (robomme_config.py).
 #
 # How zoo differs from the original HAMLET window (--memory-mode window):
@@ -25,10 +25,6 @@
 # Single-stage by default: moment tokens are randomly initialized and trained end-to-end (no TCL-initialization).
 # To use the optional two-stage paper recipe instead, first run a Stage-1 TCL job (--hamlet-mode tcl),
 # then point LOAD_MOMENT_TOKENS_FROM at its checkpoint and set FREEZE_MOMENT_TOKENS=1.
-
-module load gcc/13.2.0
-module load cuda/12.6.2
-
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
@@ -37,13 +33,13 @@ cd "$REPO_ROOT"
 # FFmpeg 7 libs *before* python starts -- otherwise `import torchcodec` raises at load
 # time and every dataloader worker silently falls back to a slower decoder backend.
 # Sourced (not executed) so torchrun and its forked workers inherit the environment.
-source "$REPO_ROOT/torchcodec_setup.sh"
+# source "$REPO_ROOT/torchcodec_setup.sh"
 
 # config (override via env)
 DATASET_PATH="${DATASET_PATH:?set DATASET_PATH to your benchmark dataset directory}"
 MODALITY_CONFIG="${MODALITY_CONFIG:-gr00t/configs/data/robomme_config.py}"  # robomme_config.py | rmbench_config.py
-OUTPUT_DIR="${OUTPUT_DIR:-runs/robomme/zoo_n1d6_pool_temporal_bucket}"
-BASE_MODEL="${BASE_MODEL:-ckpt/gr00t_n1d6}"
+OUTPUT_DIR="${OUTPUT_DIR:-runs/robomme/zoo_n1d6_pool_hamlet_sequential}"  # where to save checkpoints and logs
+BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.6-3B}"
 NUM_GPUS="${NUM_GPUS:-4}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"                  # zoo forwards 1 obs/row regardless of K, so this need not scale with K
@@ -68,11 +64,13 @@ echo "[log] $LOG_FILE"
 
 # HAMLET memory options
 MEMORY_MODE="${MEMORY_MODE:-zoo}"             # zoo | window  (see header)
-# Memory-transformer sequence length T = pool target. The pool holds K-1 PAST
-# observations plus the current one. K=1 leaves no room for history at all, so zoo
-# needs K>=2; K=4 matches the HAMLET default window.
+# Memory-transformer sequence length T = pool target. The window is
+# selected(K-M) + recent(M-1) + current: the trailing M slots always hold the M newest
+# observations and the pool selector fills the rest. K=1 leaves no room for history at
+# all, so zoo needs K>=2; K=4 matches the HAMLET default window.
 K="${K:-13}"                                   # memory window = history length
-ZOO_MAX_EPISODES="${ZOO_MAX_EPISODES:-4096}"  # LRU cap on how many episodes keep a pool
+ZOO_RECENT_SLOTS="${ZOO_RECENT_SLOTS:-4}"     # M: reserved recency slots (1 = current only, K = plain FIFO)
+ZOO_MAX_EPISODES="${ZOO_MAX_EPISODES:-10000}"  # LRU cap on how many episodes keep a pool
 MEMORY_STRIDE="${MEMORY_STRIDE:-16}"          # env steps between snapshots; set equal to the eval n_action_steps
 N_MOMENT_TOKENS="${N_MOMENT_TOKENS:-4}"       # moment tokens per step (n_q)
 MEM_COND_TYPE="${MEM_COND_TYPE:-cross_attn}"  # cross_attn | adaln
@@ -80,7 +78,7 @@ MEMORY_TYPE="${MEMORY_TYPE:-moment_token}"    # moment_token | vision_feature
 LOAD_MOMENT_TOKENS_FROM="${LOAD_MOMENT_TOKENS_FROM:-}"  # optional Stage-1 (TCL) ckpt; see README "Moment-token initialization"
 FREEZE_MOMENT_TOKENS="${FREEZE_MOMENT_TOKENS:-0}"       # 1 = freeze moment tokens (paper recipe when TCL-initialized)
 USE_KEY_MOMENT_GATE="${USE_KEY_MOMENT_GATE:-1}"        # 1 = zero memory on non-key-moment steps; 0 = plain HAMLET. Saved to checkpoint config -> eval inherits it.
-DELTA_THRESHOLD="${DELTA_THRESHOLD:-0.4}"              # key-moment threshold on normalized-joint window-end delta (only used when gate on)
+DELTA_THRESHOLD="${DELTA_THRESHOLD:-100.0}"              # key-moment threshold on normalized-joint window-end delta (only used when gate on)
 # Anchor ordering. SEQUENTIAL_ANCHORS=1 marches each batch slot forward through one
 # demonstration: slot i at iteration t+1 holds the next anchor of the same episode it
 # held at iteration t, so a (B, d) state cache stays row-aligned across iterations.
@@ -94,6 +92,9 @@ ANCHOR_STRIDE="${ANCHOR_STRIDE:-$MEMORY_STRIDE}"
 # ShardedMixtureDataset._order_for_batch_slots silently falls back to plain sequential
 # order and every slot in a batch ends up on the SAME episode. With ANCHOR_STRIDE=16 a
 # 1024-anchor shard holds ~34 episodes for RoboMME (mean 481 steps), comfortably above 8.
+
+ANCHOR_PHASES="${ANCHOR_PHASES:-3}"  # number of anchor phases (for multi-phase anchor streams, e.g. RoboMME's 2-view)
+ANCHOR_CHUNK_SIZE="${ANCHOR_CHUNK_SIZE:-30}"  # number of consecutive anchors per phase (for multi-phase anchor streams, e.g. RoboMME's 2-view)
 SHARD_SIZE="${SHARD_SIZE:-1024}"
 # >1 worker round-robins whole batches across workers reading disjoint shards, so slot i
 # at iteration t+1 would not follow slot i at iteration t. Keep at 1 in sequential mode.
@@ -112,11 +113,15 @@ ZOO_DENSITY_K="${ZOO_DENSITY_K:-4}"
 ZOO_DENSITY_TEMP="${ZOO_DENSITY_TEMP:-2.0}"
 # 1 = a candidate competes only within its temporal bucket (K-1 equal-width bins over the
 # episode so far), so no single phase can own the pool. 0 = original global-argmin eviction.
-ZOO_STRATIFIED="${ZOO_STRATIFIED:-1}"
+ZOO_STRATIFIED="${ZOO_STRATIFIED:-0}"
 
 if [ "$MEMORY_MODE" = "zoo" ]; then
     if [ "$K" -lt 2 ]; then
-        echo "[zoo] ERROR: K=$K leaves no room for history (pool holds K-1 past observations). Use K>=2." >&2
+        echo "[zoo] ERROR: K=$K leaves no room for history (the window holds K-1 past observations). Use K>=2." >&2
+        exit 1
+    fi
+    if [ "$ZOO_RECENT_SLOTS" -lt 1 ] || [ "$ZOO_RECENT_SLOTS" -gt "$K" ]; then
+        echo "[zoo] ERROR: ZOO_RECENT_SLOTS=$ZOO_RECENT_SLOTS must be in [1, K=$K]; it reserves the trailing M slots of the window, leaving K-M for the pool selector." >&2
         exit 1
     fi
     if [ "$SEQUENTIAL_ANCHORS" != "1" ]; then
@@ -153,7 +158,7 @@ fi
 echo "[cfg] host=$(hostname) commit=$(git rev-parse --short HEAD 2>/dev/null || echo n/a) dataset=$DATASET_PATH base_model=$BASE_MODEL"
 echo "[cfg] gpus=$NUM_GPUS batch=$GLOBAL_BATCH_SIZE grad_accum=$GRAD_ACCUM max_steps=$MAX_STEPS save_steps=$SAVE_STEPS"
 echo "[cfg] memory_mode=$MEMORY_MODE K=$K stride=$MEMORY_STRIDE n_moment=$N_MOMENT_TOKENS cond=$MEM_COND_TYPE type=$MEMORY_TYPE gate=$USE_KEY_MOMENT_GATE delta=$DELTA_THRESHOLD"
-echo "[cfg] zoo density_w=$ZOO_DENSITY_WEIGHT step_tau=$ZOO_STEP_TAU dist_tau=$ZOO_DIST_TAU density_k=$ZOO_DENSITY_K density_temp=$ZOO_DENSITY_TEMP max_episodes=$ZOO_MAX_EPISODES"
+echo "[cfg] zoo density_w=$ZOO_DENSITY_WEIGHT step_tau=$ZOO_STEP_TAU dist_tau=$ZOO_DIST_TAU density_k=$ZOO_DENSITY_K density_temp=$ZOO_DENSITY_TEMP max_episodes=$ZOO_MAX_EPISODES recent_slots=$ZOO_RECENT_SLOTS selected_slots=$((K - ZOO_RECENT_SLOTS))"
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 torchrun --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_PORT" \
@@ -179,4 +184,5 @@ torchrun --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_PORT" \
     --memory-type "$MEMORY_TYPE" \
     --memory-mode "$MEMORY_MODE" \
     --zoo-max-episodes "$ZOO_MAX_EPISODES" \
+    --zoo-recent-slots "$ZOO_RECENT_SLOTS" \
     "${MOMENT_ARGS[@]}"

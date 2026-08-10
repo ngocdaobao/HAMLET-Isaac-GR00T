@@ -134,6 +134,15 @@ class ShardedSingleStepDataset(ShardedDataset):
         episode_sampling_rate: Fraction of episode timesteps to use (for efficiency)
         seed: Random seed for reproducible sharding and sampling
         allow_padding: Whether to allow padding of indices to valid range [0, max_length - 1]
+        sequential_anchors: Yield anchors in temporal order within an episode
+        anchor_stride: Keep every Nth anchor
+        anchor_chunk_size: Sequential mode only. Cut each episode into runs of this many
+            anchors and treat every run as its own (virtual) episode, shuffling the runs.
+            0 disables chunking, i.e. one contiguous run per phase stream.
+        anchor_phases: Sequential mode only. How many of the `anchor_stride` phase
+            offsets to sample: offset o yields anchors o, o+N, o+2N, ... as its own
+            virtual episode. 1 keeps only offset 0 (the pre-existing behaviour);
+            `anchor_stride` (or <=0) uses every anchor of the episode.
 
     Example:
         >>> dataset = ShardedSingleStepDataset(
@@ -165,6 +174,8 @@ class ShardedSingleStepDataset(ShardedDataset):
         allow_padding: bool = False,
         sequential_anchors: bool = False,
         anchor_stride: int = 1,
+        anchor_chunk_size: int = 0,
+        anchor_phases: int = 1,
     ):
         """Initialize single-step dataset with sharding configuration."""
         super().__init__(dataset_path)
@@ -178,6 +189,17 @@ class ShardedSingleStepDataset(ShardedDataset):
         self.allow_padding = allow_padding
         self.sequential_anchors = sequential_anchors
         self.anchor_stride = max(1, anchor_stride)
+        # Chunking and phase offsets only change anything in sequential mode -- shuffled
+        # mode already breaks the temporal correlation they are meant to break, and a
+        # phase offset there is just a smaller stride.
+        self.anchor_chunk_size = anchor_chunk_size if sequential_anchors else 0
+        # Phase offsets: the stride keeps only every Nth anchor, so offsets 1..N-1 are
+        # dropped outright. Each offset is an equally valid anchor stream (still exactly
+        # `anchor_stride` apart), so sampling P of them recovers P/N of the discarded
+        # anchors as extra virtual episodes. <=0 means all N.
+        phases = self.anchor_stride if anchor_phases <= 0 else anchor_phases
+        self.anchor_phases = min(phases, self.anchor_stride) if sequential_anchors else 1
+        self.run_id_stride = 1
         self.processor = None
         self.rng = np.random.default_rng(seed)
         action_delta_indices = modality_configs["action"].delta_indices
@@ -200,6 +222,9 @@ class ShardedSingleStepDataset(ShardedDataset):
         The sharding process:
         1. Shuffle episode order for randomization
         2. Split each episode into multiple sub-sequences based on sampling rate
+           (sequential mode: split it into `anchor_phases` phase-offset streams, each
+           cut into `anchor_chunk_size`-long chunks that become independent virtual
+           episodes, instead)
         3. Distribute sub-sequences across shards to balance shard sizes
         4. Use greedy assignment to minimize shard size variance
 
@@ -222,23 +247,28 @@ class ShardedSingleStepDataset(ShardedDataset):
         # moment tokens still populate the memory window via the K-step delta_indices.
         # Datasets without an `is_demo` column are unaffected. Doing this before
         # counting keeps the shard count in sync with the steps actually distributed.
+        # The stride subsample is NOT applied here -- `_build_runs` does it once per
+        # phase offset, so the anchors this drops can still be picked up by another
+        # offset instead of being discarded for good.
         episode_anchor_indices: dict[int, np.ndarray] = {}
         for ep_idx in shuffled_episode_indices:
-            step_indices = np.arange(0, self.get_effective_episode_length(ep_idx)) 
+            step_indices = np.arange(0, self.get_effective_episode_length(ep_idx))
             # step_indices = Range of steps in an episode
             valid_mask = self._anchor_valid_mask(int(ep_idx), len(step_indices)) # Mask for valid anchors (is_demo=False)
             if valid_mask is not None:
                 step_indices = step_indices[valid_mask]
-            # Subsample before counting so num_shards matches the anchors actually
-            # distributed below, keeping shards at ~shard_size.
-            if self.anchor_stride > 1:
-                step_indices = step_indices[:: self.anchor_stride]
             episode_anchor_indices[int(ep_idx)] = step_indices
 
+        # Split each episode into phase-offset streams and cut those into fixed-length
+        # chunks, each of which becomes an independent virtual episode. Without this,
+        # sequential mode marches every batch slot from step 0 of its demonstration in
+        # lockstep, so iteration t only ever shows the model states from phase t of the
+        # task. Short chunks with a shuffled order put unrelated task phases in one batch
+        # while each slot still walks forward in time.
+        runs = self._build_runs(shuffled_episode_indices, episode_anchor_indices)
+
         # Calculate total timesteps and required number of shards
-        total_steps = np.sum(
-            [len(episode_anchor_indices[int(idx)]) for idx in shuffled_episode_indices]
-        ).astype(int) # Total number of steps across all episodes
+        total_steps = np.sum([len(step_indices) for _, _, step_indices in runs]).astype(int)
         num_shards = np.ceil(total_steps / self.shard_size).astype(int)
 
         # Initialize shard containers
@@ -246,10 +276,8 @@ class ShardedSingleStepDataset(ShardedDataset):
         shard_lengths = np.zeros(num_shards, dtype=int)
 
         # Distribute episode sub-sequences across shards
-        for ep_idx in shuffled_episode_indices:
-            step_indices = episode_anchor_indices[int(ep_idx)].copy()
-            if step_indices.size == 0:
-                continue
+        for ep_idx, virtual_ep_idx, run_step_indices in runs:
+            step_indices = run_step_indices.copy()
             if not self.sequential_anchors:
                 self.rng.shuffle(step_indices)
             splits = [step_indices[i::num_splits] for i in range(num_splits)]
@@ -258,7 +286,7 @@ class ShardedSingleStepDataset(ShardedDataset):
                     continue
                 # Assign to shard with minimum current length (greedy balancing)
                 shard_index = np.argmin(shard_lengths)
-                sharded_episodes[shard_index].append((ep_idx, split_step_indices))
+                sharded_episodes[shard_index].append((ep_idx, virtual_ep_idx, split_step_indices))
                 shard_lengths[shard_index] += len(split_step_indices)
 
         # Validate shard creation
@@ -270,8 +298,92 @@ class ShardedSingleStepDataset(ShardedDataset):
         print(
             f"Total steps: {total_steps}, average shard length: {total_steps / num_shards}, shard length std: {np.std(shard_lengths)}"
         )
+        if self.run_id_stride > 1:
+            print(
+                f"Anchor runs: {len(runs)} virtual episodes from {len(episode_anchor_indices)} "
+                f"episodes (phases={self.anchor_phases} of stride {self.anchor_stride}, "
+                f"chunk={self.anchor_chunk_size or 'off'}; "
+                f"virtual id = episode * {self.run_id_stride} + run)"
+            )
         self.sharded_episodes = sharded_episodes
         self.shard_lengths = shard_lengths
+
+    def _phase_offsets(self) -> np.ndarray:
+        """Starting offsets of the phase-shifted anchor streams.
+
+        With stride N and P phases these are P offsets spread evenly over [0, N), so at
+        P == N every anchor of the episode belongs to exactly one stream (offset 0 gives
+        0, N, 2N, ...; offset 1 gives 1, N+1, 2N+1, ...) and nothing is discarded. Lower
+        P keeps the streams as far apart as possible, so the near-duplicate frames of
+        neighbouring offsets are not both spent on a small budget.
+        """
+        if self.anchor_phases <= 1:
+            return np.zeros(1, dtype=int)
+        offsets = np.linspace(0, self.anchor_stride, self.anchor_phases, endpoint=False)
+        return np.unique(offsets.astype(int))
+
+    def _build_runs(
+        self,
+        shuffled_episode_indices: np.ndarray,
+        episode_anchor_indices: dict[int, np.ndarray],
+    ) -> list[tuple[int, int, np.ndarray]]:
+        """Turn per-episode anchors into the contiguous runs the shards are built from.
+
+        Each run is one phase-offset stream of one episode (`anchors[offset::stride]`),
+        optionally cut into `anchor_chunk_size`-long chunks. Returns
+        (episode_index, virtual_episode_index, step_indices) triples: the episode index
+        is what `get_shard` loads frames from; the virtual index is what each datapoint
+        is tagged with, and is what the model keys its per-episode state by -- two runs
+        of one demonstration must not share a key, or the memory pool of the batch slot
+        holding the second would be poisoned by the first.
+
+        With one phase and no chunking there is one run per episode and the two indices
+        coincide, which is the pre-existing behaviour.
+        """
+        offsets = self._phase_offsets()
+        chunk_size = self.anchor_chunk_size
+
+        # Group the runs by episode first so the packed virtual ids can be assigned once
+        # the widest episode is known.
+        runs_by_episode: dict[int, list[np.ndarray]] = {}
+        for ep_idx in shuffled_episode_indices:
+            anchors = episode_anchor_indices[int(ep_idx)]
+            episode_runs = []
+            for offset in offsets:
+                stream = anchors[offset :: self.anchor_stride]
+                if stream.size == 0:
+                    continue
+                if chunk_size <= 0:
+                    episode_runs.append(stream)
+                    continue
+                for start in range(0, len(stream), chunk_size):
+                    episode_runs.append(stream[start : start + chunk_size])
+            if episode_runs:
+                runs_by_episode[int(ep_idx)] = episode_runs
+
+        max_runs = max((len(r) for r in runs_by_episode.values()), default=1)
+        if max_runs <= 1:
+            # One run per episode: the virtual index is just the episode index, and the
+            # episode order is already shuffled, so nothing below applies.
+            self.run_id_stride = 1
+            return [(ep_idx, ep_idx, r[0]) for ep_idx, r in runs_by_episode.items()]
+
+        # Power of ten so the packed id stays readable in the batch-image dumps and the
+        # memory debug logs: episode 12, run 3 reads as 12003. Runs are numbered
+        # phase-major, so run = phase_index * chunks_per_phase + chunk_index.
+        self.run_id_stride = 10 ** max(3, len(str(max_runs)))
+
+        runs = [
+            (ep_idx, ep_idx * self.run_id_stride + run_id, steps)
+            for ep_idx, episode_runs in runs_by_episode.items()
+            for run_id, steps in enumerate(episode_runs)
+        ]
+
+        # Shuffle so runs of one episode are not dealt to neighbouring batch slots: the
+        # greedy assignment below walks this list in order, so leaving it grouped would
+        # put the same demonstration's phases side by side in a batch again.
+        order = self.rng.permutation(len(runs))
+        return [runs[i] for i in order]
 
     def get_effective_episode_length(self, episode_index: int) -> int:
         """Get the effective episode length accounting for action horizon."""
@@ -345,7 +457,7 @@ class ShardedSingleStepDataset(ShardedDataset):
         Pure metadata (no episode loading), so callers can recover the episode
         boundaries inside the flat datapoint list returned by `get_shard`.
         """
-        return [len(step_indices) for _, step_indices in self.sharded_episodes[idx]]
+        return [len(step_indices) for _, _, step_indices in self.sharded_episodes[idx]]
 
     def get_shard(self, idx: int) -> list:
         """
@@ -364,13 +476,17 @@ class ShardedSingleStepDataset(ShardedDataset):
         # Tag each datapoint with its provenance. The batch image dump (VIZ_BATCH_DIR)
         # names files by it, and the model's key-moment gate keys its state cache by
         # episode and uses the step index to detect episode restarts (epoch wrap).
+        # The tag is the VIRTUAL episode index (see `_build_runs`), so each chunk is a
+        # separate demonstration as far as the model's per-episode state is concerned.
+        # Step indices stay absolute within the real episode: they only have to be
+        # strictly increasing inside a run, which chunking preserves.
         datapoints = []
-        for ep_idx, step_indices in episodes:
+        for ep_idx, virtual_ep_idx, step_indices in episodes:
             # Load episode data once per episode in shard
             episode_data = self.episode_loader[ep_idx]
             for step_index in step_indices:
                 datapoint = self.get_datapoint(episode_data, step_index)
-                datapoint["_viz_episode_index"] = int(ep_idx)
+                datapoint["_viz_episode_index"] = int(virtual_ep_idx)
                 datapoint["_viz_step_index"] = int(step_index)
                 datapoints.append(datapoint)
         return datapoints

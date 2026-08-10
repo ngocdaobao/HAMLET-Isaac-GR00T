@@ -58,6 +58,8 @@ class DatasetFactory:
                     allow_padding=self.config.data.allow_padding,
                     sequential_anchors=self.config.data.sequential_anchors,
                     anchor_stride=self.config.data.anchor_stride,
+                    anchor_chunk_size=self.config.data.anchor_chunk_size,
+                    anchor_phases=self.config.data.anchor_phases,
                 )
                 datasets.append(dataset)
             dataset_lengths = np.array([len(dataset) for dataset in datasets])

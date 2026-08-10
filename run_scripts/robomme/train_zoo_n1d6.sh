@@ -86,6 +86,21 @@ SEQUENTIAL_ANCHORS="${SEQUENTIAL_ANCHORS:-1}"
 # consecutive anchors of a slot are exactly one memory window apart -- what the
 # key-moment gate pairs and what the eval rollout does (one call per n_action_steps).
 ANCHOR_STRIDE="${ANCHOR_STRIDE:-$MEMORY_STRIDE}"
+# Anchors per virtual episode. Each episode is cut into contiguous runs of this many
+# anchors and every run is treated as its own episode (own memory-pool key), with the
+# runs shuffled. Without it every batch slot marches from step 0 in lockstep, so
+# iteration t only ever shows the model phase t of the task. Anchors inside a run stay
+# sequential and ANCHOR_STRIDE apart, so the pool still sees a coherent history -- it
+# just re-warms at each run boundary, which is why the run should span a few windows.
+# 0 = auto (2 * K); negative = off (one contiguous run per episode).
+ANCHOR_CHUNK_SIZE="${ANCHOR_CHUNK_SIZE:-0}"
+# Phase offsets per episode. The stride keeps anchors 0, N, 2N, ... and discards the
+# rest, but offset o gives the equally valid, equally spaced stream o, o+N, o+2N, ...
+# ANCHOR_PHASES=P uses P offsets spread over [0, N), each as its own virtual episode, so
+# P/N of every episode's frames become anchors instead of 1/N. P=1 is the old behaviour;
+# P=ANCHOR_STRIDE (or 0) uses every frame and multiplies the shard count -- and so the
+# length of an epoch, not the number of training steps -- by N.
+ANCHOR_PHASES="${ANCHOR_PHASES:-1}"
 # Shard size must hold at least (GLOBAL_BATCH_SIZE / NUM_GPUS) whole episodes, or
 # ShardedMixtureDataset._order_for_batch_slots silently falls back to plain sequential
 # order and every slot in a batch ends up on the SAME episode. With ANCHOR_STRIDE=16 a
@@ -133,6 +148,7 @@ if [ "$ZOO_STRATIFIED" = "1" ]; then MOMENT_ARGS+=(--zoo-stratified); else MOMEN
 [ -n "$LOAD_MOMENT_TOKENS_FROM" ] && MOMENT_ARGS+=(--load-moment-tokens-from "$LOAD_MOMENT_TOKENS_FROM")
 if [ "$SEQUENTIAL_ANCHORS" = "1" ]; then
     MOMENT_ARGS+=(--sequential-anchors --anchor-stride "$ANCHOR_STRIDE")
+    MOMENT_ARGS+=(--anchor-chunk-size "$ANCHOR_CHUNK_SIZE" --anchor-phases "$ANCHOR_PHASES")
 fi
 
 ##Remove when no need to visualize image
