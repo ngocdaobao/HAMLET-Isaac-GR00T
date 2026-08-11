@@ -484,10 +484,15 @@ class ShardedSingleStepDataset(ShardedDataset):
         for ep_idx, virtual_ep_idx, step_indices in episodes:
             # Load episode data once per episode in shard
             episode_data = self.episode_loader[ep_idx]
-            for step_index in step_indices:
+            last_pos = len(step_indices) - 1
+            for pos, step_index in enumerate(step_indices):
                 datapoint = self.get_datapoint(episode_data, step_index)
                 datapoint["_viz_episode_index"] = int(virtual_ep_idx)
                 datapoint["_viz_step_index"] = int(step_index)
+                # Final anchor of this virtual episode: sequential sampling never
+                # revisits it, so the model can drop the episode's memory pool right
+                # after this step instead of holding it until the LRU eviction.
+                datapoint["_viz_is_last_step"] = int(pos == last_pos)
                 datapoints.append(datapoint)
         return datapoints
 

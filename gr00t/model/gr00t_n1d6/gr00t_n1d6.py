@@ -518,6 +518,7 @@ class Gr00tN1d6ActionHead(nn.Module):
         steps: list | None = None,
         action_inputs_B: int | None = None,
         reset_memory: torch.Tensor | None = None,
+        is_last: list | None = None,
     ) -> BatchFeature:
 
         n_q = int(backbone_output["n_moment_tokens"])
@@ -548,6 +549,16 @@ class Gr00tN1d6ActionHead(nn.Module):
             )
         if steps is None:
             steps = [None] * B
+        # `is_last[i]` marks the final anchor of row i's (virtual) episode. Sampling is
+        # sequential, so nothing further will ever be appended to that pool -- it is
+        # dropped at the end of this call. None (inference, or a dataset that does not
+        # tag the boundary) means "never last" and the pool lives until eviction.
+        if is_last is None:
+            is_last = [False] * B
+        elif len(is_last) != B:
+            raise RuntimeError(
+                f"zoo memory got {len(is_last)} end-of-episode flags for B={B} rows."
+            )
 
         # mem_seq is `selected(K-m) + recent(m-1) + [current]`. The trailing `m` blocks
         # are reserved for the newest observations, so the selector never has to spend a
@@ -675,6 +686,17 @@ class Gr00tN1d6ActionHead(nn.Module):
                     f"steps={sorted(pool['step_ids'])}",
                     flush=True,
                 )
+
+            # The episode ends here: mem_seq for this row is already built, and the
+            # sampler will not come back to this step. Free the pool now -- if the
+            # episode is dealt again (next epoch) it is re-cached from its first step.
+            if bool(is_last[idx]):
+                self.memory_pool.pop(key, None)
+                if _MEM_DEBUG:
+                    # The debug frames/strips are deliberately left on disk: this is the
+                    # end of the episode, so they are the record worth looking at. The
+                    # restart branch above clears them if the episode is ever dealt again.
+                    print(f"[mem] pool ep={key} dropped at last step {step_id}", flush=True)
 
         self._evict_zoo_pool()
         backbone_output["mem_seq"] = torch.stack(mem_seq, dim=0).view(B, K_target * n_q, d)
@@ -1046,6 +1068,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                 steps=action_input.get("steps", None),
                 action_inputs_B=B_target,
                 reset_memory=action_input.get("reset_memory", None),
+                is_last=action_input.get("is_last_step", None),
             )
             backbone_output = self.process_backbone_output_zoo(
                 backbone_output,
@@ -1174,6 +1197,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                 steps=action_input.get("steps", None),
                 action_inputs_B=B_target,
                 reset_memory=reset_memory,
+                is_last=action_input.get("is_last_step", None),
             )
             backbone_output = self.process_backbone_output_zoo(
                 backbone_output,
@@ -1485,6 +1509,7 @@ class Gr00tN1d6(PreTrainedModel):
 
         mask_key_moment = None
         steps = None
+        is_last_step = None
         # Row identity is needed by the key-moment gate AND by the zoo memory pool, which
         # is keyed by episode -- so resolve it whenever either is active.
         needs_row_keys = self.use_key_moment_gate or getattr(self.config, "memory_mode", "window") == "zoo"
@@ -1502,6 +1527,11 @@ class Gr00tN1d6(PreTrainedModel):
 
         if row_keys is not None:
             steps = step_idx.tolist() if step_idx is not None else [None] * len(row_keys)
+            # End-of-episode marker from the sampler (training only; absent at inference
+            # and for datasets that do not tag it). The zoo pool is freed on these rows.
+            last_flags = backbone_inputs.get("_viz_is_last_step", None)
+            if last_flags is not None:
+                is_last_step = [bool(f) for f in last_flags.tolist()]
             if reset_state is not None:
                 for idx, flag in enumerate(list(reset_state)):
                     if bool(flag):
@@ -1537,8 +1567,17 @@ class Gr00tN1d6(PreTrainedModel):
                         f"thr={self.delta_threshold} mask={mask_key_moment[idx]}",
                         flush=True,
                     )
-                self.state_cache[key] = (states[idx], steps[idx])
                 # Cache delta for visualization (debugging / analysis). The cache is keyed by episode index
+                if is_last_step is not None and is_last_step[idx]:
+                    # End of the episode: the gate never pairs across episodes (the step
+                    # index restarts there), so this state has no successor to pair with.
+                    # Same drop as the zoo pool -- and unlike the pool, which has an LRU
+                    # cap, nothing else ever bounds this dict.
+                    self.state_cache.pop(key, None)
+                else:
+                    # `states[idx]` is a view into this batch's state tensor, so caching
+                    # it pins that whole tensor for as long as the entry lives; clone.
+                    self.state_cache[key] = (states[idx].clone(), steps[idx])
 
         # Move to device and dtype
         def to_device_with_dtype(x):
@@ -1556,7 +1595,9 @@ class Gr00tN1d6(PreTrainedModel):
         if row_keys is not None:
             action_inputs["row_keys"] = row_keys
             action_inputs["steps"] = steps
-        return backbone_inputs, action_inputs 
+            if is_last_step is not None:
+                action_inputs["is_last_step"] = is_last_step
+        return backbone_inputs, action_inputs
 
     def compute_window_delta(self, pos_pair: list[torch.Tensor]) -> int:
         """
