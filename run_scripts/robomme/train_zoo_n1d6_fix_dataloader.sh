@@ -70,7 +70,7 @@ MEMORY_MODE="${MEMORY_MODE:-zoo}"             # zoo | window  (see header)
 # all, so zoo needs K>=2; K=4 matches the HAMLET default window.
 K="${K:-13}"                                   # memory window = history length
 ZOO_RECENT_SLOTS="${ZOO_RECENT_SLOTS:-4}"     # M: reserved recency slots (1 = current only, K = plain FIFO)
-ZOO_MAX_EPISODES="${ZOO_MAX_EPISODES:-4096}"  # LRU cap on how many episodes keep a pool
+ZOO_MAX_EPISODES="${ZOO_MAX_EPISODES:-1000}"  # LRU cap on how many episodes keep a pool
 MEMORY_STRIDE="${MEMORY_STRIDE:-16}"          # env steps between snapshots; set equal to the eval n_action_steps
 N_MOMENT_TOKENS="${N_MOMENT_TOKENS:-4}"       # moment tokens per step (n_q)
 MEM_COND_TYPE="${MEM_COND_TYPE:-cross_attn}"  # cross_attn | adaln
@@ -93,8 +93,8 @@ ANCHOR_STRIDE="${ANCHOR_STRIDE:-$MEMORY_STRIDE}"
 # order and every slot in a batch ends up on the SAME episode. With ANCHOR_STRIDE=16 a
 # 1024-anchor shard holds ~34 episodes for RoboMME (mean 481 steps), comfortably above 8.
 
-ANCHOR_PHASES="${ANCHOR_PHASES:-1}"  # number of anchor phases (for multi-phase anchor streams, e.g. RoboMME's 2-view)
-ANCHOR_CHUNK_SIZE="${ANCHOR_CHUNK_SIZE:-50}"  # number of consecutive anchors per phase (for multi-phase anchor streams, e.g. RoboMME's 2-view)
+ANCHOR_PHASES="${ANCHOR_PHASES:-4}"  # number of anchor phases (for multi-phase anchor streams, e.g. RoboMME's 2-view)
+ANCHOR_CHUNK_SIZE="${ANCHOR_CHUNK_SIZE:-30}"  # number of consecutive anchors per phase (for multi-phase anchor streams, e.g. RoboMME's 2-view)
 SHARD_SIZE="${SHARD_SIZE:-1024}"
 # >1 worker round-robins whole batches across workers reading disjoint shards, so slot i
 # at iteration t+1 would not follow slot i at iteration t. Keep at 1 in sequential mode.
