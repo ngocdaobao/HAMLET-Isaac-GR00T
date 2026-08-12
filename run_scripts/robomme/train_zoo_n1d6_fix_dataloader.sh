@@ -93,8 +93,8 @@ ANCHOR_STRIDE="${ANCHOR_STRIDE:-$MEMORY_STRIDE}"
 # order and every slot in a batch ends up on the SAME episode. With ANCHOR_STRIDE=16 a
 # 1024-anchor shard holds ~34 episodes for RoboMME (mean 481 steps), comfortably above 8.
 
-ANCHOR_PHASES="${ANCHOR_PHASES:-4}"  # number of anchor phases (for multi-phase anchor streams, e.g. RoboMME's 2-view)
-ANCHOR_CHUNK_SIZE="${ANCHOR_CHUNK_SIZE:-30}"  # number of consecutive anchors per phase (for multi-phase anchor streams, e.g. RoboMME's 2-view)
+ANCHOR_PHASES="${ANCHOR_PHASES:-3}"  # number of anchor phases (for multi-phase anchor streams, e.g. RoboMME's 2-view)
+ANCHOR_CHUNK_SIZE="${ANCHOR_CHUNK_SIZE:-20}"  # number of consecutive anchors per phase (for multi-phase anchor streams, e.g. RoboMME's 2-view)
 SHARD_SIZE="${SHARD_SIZE:-1024}"
 # >1 worker round-robins whole batches across workers reading disjoint shards, so slot i
 # at iteration t+1 would not follow slot i at iteration t. Keep at 1 in sequential mode.
