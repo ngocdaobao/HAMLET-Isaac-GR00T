@@ -38,7 +38,7 @@ cd "$REPO_ROOT"
 # config (override via env)
 DATASET_PATH="${DATASET_PATH:?set DATASET_PATH to your benchmark dataset directory}"
 MODALITY_CONFIG="${MODALITY_CONFIG:-gr00t/configs/data/robomme_config.py}"  # robomme_config.py | rmbench_config.py
-OUTPUT_DIR="${OUTPUT_DIR:-runs/robomme/zoo_n1d6_fix_dataloader}"  # where to save checkpoints and logs
+OUTPUT_DIR="${OUTPUT_DIR:-runs/robomme/zoo_n1d6_fix_dataloader_11_history}"  # where to save checkpoints and logs
 BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.6-3B}"
 NUM_GPUS="${NUM_GPUS:-4}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
@@ -68,7 +68,7 @@ MEMORY_MODE="${MEMORY_MODE:-zoo}"             # zoo | window  (see header)
 # selected(K-M) + recent(M-1) + current: the trailing M slots always hold the M newest
 # observations and the pool selector fills the rest. K=1 leaves no room for history at
 # all, so zoo needs K>=2; K=4 matches the HAMLET default window.
-K="${K:-13}"                                   # memory window = history length
+K="${K:-11}"                                   # memory window = history length
 ZOO_RECENT_SLOTS="${ZOO_RECENT_SLOTS:-4}"     # M: reserved recency slots (1 = current only, K = plain FIFO)
 ZOO_MAX_EPISODES="${ZOO_MAX_EPISODES:-1000}"  # LRU cap on how many episodes keep a pool
 MEMORY_STRIDE="${MEMORY_STRIDE:-16}"          # env steps between snapshots; set equal to the eval n_action_steps
