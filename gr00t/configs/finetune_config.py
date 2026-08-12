@@ -93,7 +93,7 @@ class FinetuneConfig:
     dataloader_num_workers: int = 1
     """Number of parallel worker processes used for data loading."""
 
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-4
     """Initial learning rate for optimizer."""
 
     gradient_accumulation_steps: int = 1

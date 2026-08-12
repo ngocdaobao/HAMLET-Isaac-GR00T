@@ -102,7 +102,7 @@ SHARD_SIZE="${SHARD_SIZE:-1024}"
 # workers a shard's batches land every Nth iteration, but _order_for_batch_slots still
 # advances each episode by one anchor per appearance, so that episode's observations
 # still arrive in temporal order ANCHOR_STRIDE apart -- which is all the pool needs.
-DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-5}"
 
 
 # Memory pool selection hyperparameters (see gr00t_n1d6.py _pool_density)
