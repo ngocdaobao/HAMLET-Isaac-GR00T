@@ -68,7 +68,7 @@ MEMORY_MODE="${MEMORY_MODE:-zoo}"             # zoo | window  (see header)
 # selected(K-M) + recent(M-1) + current: the trailing M slots always hold the M newest
 # observations and the pool selector fills the rest. K=1 leaves no room for history at
 # all, so zoo needs K>=2; K=4 matches the HAMLET default window.
-K="${K:-11}"                                   # memory window = history length
+K="${K:-13}"                                   # memory window = history length
 ZOO_RECENT_SLOTS="${ZOO_RECENT_SLOTS:-4}"     # M: reserved recency slots (1 = current only, K = plain FIFO)
 ZOO_MAX_EPISODES="${ZOO_MAX_EPISODES:-1000}"  # LRU cap on how many episodes keep a pool
 MEMORY_STRIDE="${MEMORY_STRIDE:-16}"          # env steps between snapshots; set equal to the eval n_action_steps
