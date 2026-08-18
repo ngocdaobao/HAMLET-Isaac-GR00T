@@ -5,14 +5,23 @@ Reads `<run_dir>/<TASK>/mem_attn/memory_attention.jsonl` (one JSON line per poli
 written by Gr00tPolicy via gr00t/model/modules/memory_attribution.py) and reports, per
 task, WHICH pooled step the action head read:
 
+Every slot of the window competes, tagged by what it is: P = pooled (won the admission
+contest), R = reserved-recent (handed the last observations unconditionally), C = the
+live observation. That separation is the point -- attention landing on R or C is not
+evidence the pool selected well.
+
     mass        mean probability the action tokens put on the memory tokens at all.
                 Near zero means memory is barely being used (or the key-moment gate
                 zeroed it), and the rest of the row says little.
-    slot        how often each pool slot won, oldest slot first. Flat means the pool is
-                being read broadly; all mass on the last slot means the action head only
-                ever reads the most recent block, i.e. the pool is doing no work a short
-                FIFO window could not.
-    age         how far back the winning step was captured, in policy calls. This is the
+    won         how often each slot took the argmax, oldest slot first.
+    mean        each slot's mean score over ALL calls, not just the ones it won -- a
+                slot can matter steadily without ever taking the argmax, which `won`
+                alone hides.
+    winner      the same argmax broken down by slot kind. Mostly C means the window adds
+                nothing over the frame the backbone just encoded; mostly R means a short
+                FIFO would do; P is the only share that credits the pool.
+    age         how far back the winning step was captured, in policy calls, over the
+                history winners (C is always 0 and would only dilute it). This is the
                 quantity a long-horizon memory is supposed to make large.
     padding     share of calls whose winner was a warm-up duplicate rather than a real
                 pooled memory -- high means the pool is still filling (or restarting)
@@ -50,9 +59,13 @@ def _rows(jsonl: Path) -> list[dict]:
 
 
 def _winner(row: dict) -> dict | None:
-    """Highest-scoring block that is not the live observation."""
-    pool = [s for s in row["steps"] if not s["is_current"]]
-    return max(pool, key=lambda s: s["score"]) if pool else None
+    """Highest-scoring block of the window, live observation included.
+
+    Every slot competes: which step the memory transformer makes the action read is the
+    question, and "the current one" is a real answer -- it means the K-block window is
+    adding nothing over the frame the backbone just encoded.
+    """
+    return max(row["steps"], key=lambda s: s["score"]) if row["steps"] else None
 
 
 def _age(row: dict, win: dict) -> int | None:
@@ -76,32 +89,59 @@ def summarize(rows: list[dict]) -> dict:
     if not wins:
         return {}
     window = rows[0]["window"]
-    ages = [a for a in (_age(r, w) for r, w in wins) if a is not None]
+    # Ages of the winners that are actual history: the live block is always age 0 and
+    # would drag the mean toward it without saying anything about the memory.
+    ages = [_age(r, w) for r, w in wins if not w["is_current"]]
+    ages = [a for a in ages if a is not None]
+    kinds = [w.get("slot_kind", "pool") for _, w in wins]
+    # Mean score of each slot over ALL calls (not just the ones it won): a slot can
+    # matter steadily without ever taking the argmax.
+    per_slot: dict[int, list[float]] = {}
+    for r in rows:
+        for s in r["steps"]:
+            per_slot.setdefault(s["block_index"], []).append(s["score"])
     return {
         "calls": len(rows),
         "episodes": len({r.get("session_id") or r.get("episode_id") for r in rows}),
         "mass": statistics.fmean(r["memory_attention_mass"] for r in rows),
         "slots": Counter(w["block_index"] for _, w in wins),
+        "slot_mean": {i: statistics.fmean(v) for i, v in per_slot.items()},
+        "kinds": Counter(kinds),
+        "kind_of": {s["block_index"]: s.get("slot_kind", "pool") for s in rows[0]["steps"]},
         "window": window,
         "age_mean": statistics.fmean(ages) if ages else float("nan"),
         "age_p50": statistics.median(ages) if ages else float("nan"),
         "age_max": max(ages) if ages else float("nan"),
+        "age_n": len(ages),
         "padding": statistics.fmean(float(w["is_padding"]) for _, w in wins),
         "source": rows[0].get("source", "?"),
     }
 
 
+_KIND_TAG = {"pool": "P", "recent": "R", "current": "C", "window": "W"}
+
+
 def _fmt(task: str, s: dict) -> list[str]:
     n = sum(s["slots"].values())
-    slots = "  ".join(
-        f"b{i}:{100 * s['slots'].get(i, 0) / n:4.1f}%" for i in range(s["window"] - 1)
+    idx = range(s["window"])
+    tags = [_KIND_TAG.get(s["kind_of"].get(i, "pool"), "?") for i in idx]
+    won = "  ".join(f"b{i}{t}:{100 * s['slots'].get(i, 0) / n:5.1f}%" for i, t in zip(idx, tags))
+    mean = "  ".join(f"b{i}{t}:{100 * s['slot_mean'].get(i, 0.0):5.1f}%" for i, t in zip(idx, tags))
+    kinds = "  ".join(
+        f"{k}:{100 * v / n:.1f}%" for k, v in sorted(s["kinds"].items(), key=lambda kv: -kv[1])
     )
     return [
         f"[{task}] calls={s['calls']} episodes={s['episodes']} "
-        f"mass={s['mass']:.4f} src={s['source']}",
-        f"    slot   {slots}",
-        f"    age    mean {s['age_mean']:.1f}  p50 {s['age_p50']:.1f}  max {s['age_max']}"
-        " (policy calls back)",
+        f"mass={s['mass']:.4f} src={s['source']}   (P=pooled R=recent C=current)",
+        f"    won    {won}",
+        f"    mean   {mean}",
+        f"    winner {kinds}",
+        (
+            f"    age    mean {s['age_mean']:.1f}  p50 {s['age_p50']:.1f}  "
+            f"max {s['age_max']} (policy calls back, history winners only)"
+            if s["age_n"]
+            else "    age    -- (the live observation won every call)"
+        ),
         f"    padding winners {100 * s['padding']:.1f}%",
     ]
 

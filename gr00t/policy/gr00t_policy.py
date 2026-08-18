@@ -22,6 +22,11 @@ from .policy import BasePolicy, PolicyWrapper
 # Matches GR00T_MEM_DEBUG in gr00t/model/gr00t_n1d6/gr00t_n1d6.py: when set, hand the
 # raw frames to the action head so it can dump the observations it caches.
 _MEM_DEBUG = bool(os.environ.get("GR00T_MEM_DEBUG"))
+# GR00T_MEM_ATTR=1 attributes each action to the memory blocks it read, one JSON line per
+# policy call. GR00T_MEM_ATTR_OUT overrides the destination; summarize with
+# gr00t/eval/sim/robomme/aggregate_mem_attention.py.
+_MEM_ATTR = bool(os.environ.get("GR00T_MEM_ATTR"))
+_MEM_ATTR_OUT = os.environ.get("GR00T_MEM_ATTR_OUT", "mem_attn/memory_attention.jsonl")
 
 
 def _rec_to_dtype(x: Any, dtype: torch.dtype) -> Any:
@@ -125,6 +130,20 @@ class Gr00tPolicy(BasePolicy):
             if "video" in self.modality_configs:
                 self.modality_configs["video"].delta_indices = [0]
 
+        # Memory-attention attribution: which pooled step did the action head read?
+        # The probe only reads attention through hooks, so it changes no output.
+        self._mem_probe = None
+        self._mem_attr_calls: dict[str, int] = {}
+        if _MEM_ATTR and self.use_hamlet_inference:
+            from gr00t.model.modules.memory_attribution import MemoryAttentionProbe
+
+            try:
+                self._mem_probe = MemoryAttentionProbe(self.model.action_head).attach()
+                print(f"[mem-attr] probe attached, writing {_MEM_ATTR_OUT}", flush=True)
+            except ValueError as e:
+                # No memory transformer on this checkpoint -- nothing to attribute.
+                print(f"[mem-attr] disabled: {e}", flush=True)
+
         # Extract and validate language configuration
         # Currently only supports single language input per timestep
         language_keys = self.modality_configs["language"].modality_keys
@@ -132,6 +151,27 @@ class Gr00tPolicy(BasePolicy):
         assert len(language_keys) == 1, "Only one language key is supported"
         assert len(language_delta_indices) == 1, "Only one language delta index is supported"
         self.language_key = language_keys[0]
+ 
+    def _log_memory_attribution(self, session_ids: list[str] | None) -> None:
+        """Append one row per batch sample ranking the memory blocks the action read.
+
+        Each row carries the score of every block of `mem_seq` (they sum to 1), so the
+        winner is the pooled step this action attended to most. `session_id` and
+        `call_index` locate the call inside its episode.
+        """
+        reports = self._mem_probe.report()
+        if not reports:
+            return  # the call ran without HAMLET memory
+        extra = []
+        for i in range(len(reports)):
+            sid = session_ids[i] if session_ids and i < len(session_ids) else "default"
+            n = self._mem_attr_calls.get(sid, 0)
+            self._mem_attr_calls[sid] = n + 1
+            extra.append({"session_id": sid, "call_index": n})
+        self._mem_probe.dump_jsonl(_MEM_ATTR_OUT, extra=extra)
+        if _MEM_DEBUG:
+            for r in reports:
+                print(r.summary(), flush=True)
 
     def _unbatch_observation(self, value: dict[str, Any]) -> list[dict[str, Any]]:
         """Unbatch a batched observation into a list of single observations.
@@ -445,6 +485,11 @@ class Gr00tPolicy(BasePolicy):
                 model_pred = self.model.get_action(**collated_inputs, options=mem_options)
             else:
                 model_pred = self.model.get_action(**collated_inputs)
+
+        if self._mem_probe is not None and not (options or {}).get("prime_only"):
+            # Priming calls are skipped: they return before the DiT runs, so there is no
+            # cross-attention hop to weight the memory blocks with.
+            self._log_memory_attribution(session_ids)
 
         if self.use_hamlet_inference:
             new_cached = self.model.action_head._memory_cache

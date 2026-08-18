@@ -570,6 +570,11 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         self._zoo_tick += 1
         mem_seq = []
+        # Step id of every block of mem_seq, oldest-first, one row per sample. Kept
+        # unconditionally (a list of K ints per row) so attribution probes can label the
+        # blocks with the steps they were captured at; see
+        # gr00t/model/modules/memory_attribution.py.
+        block_step_ids: list[list[int]] = []
         for idx, key in enumerate(episode_ids):
             pool = self.memory_pool.get(key)
             step = steps[idx]
@@ -651,22 +656,23 @@ class Gr00tN1d6ActionHead(nn.Module):
             # must be re-sorted by their source step.
             order = sorted(range(len(pool["tokens"])), key=lambda i: pool["step_ids"][i])
             past = [pool["tokens"][i] for i in order]
+            past_ids = [pool["step_ids"][i] for i in order]
             if len(past) < cap:
                 # Warm-up: left-pad by repeating the oldest available block (or the
-                # oldest reserved one when the pool is still empty).
+                # oldest reserved one when the pool is still empty). `past_ids` repeats
+                # the same id, which is what marks the slot as padding downstream.
                 oldest = past[0] if past else recent_toks[0] if recent_toks else current[idx]
+                oldest_id = past_ids[0] if past_ids else (recent_ids[0] if recent_ids else step_id)
+                past_ids = [oldest_id] * (cap - len(past)) + past_ids
                 past = [oldest] * (cap - len(past)) + past
             # selected (K-m) -> recent (t-m+1 .. t-1) -> current (t), oldest-first.
             tail = recent_toks + [current[idx]]
             mem_seq.append(torch.stack(past + tail, dim=0))  # (K_target, n_q, d)
+            block_step_ids.append(past_ids + recent_ids + [step_id])
 
             if _MEM_DEBUG:
                 # Same slots, same oldest-first order, same left-padding as `past` above,
                 # so the strip is a faithful picture of the blocks that were just stacked.
-                past_ids = [pool["step_ids"][i] for i in order]
-                if len(past_ids) < cap:
-                    oldest_id = past_ids[0] if past_ids else (recent_ids[0] if recent_ids else step_id)
-                    past_ids = [oldest_id] * (cap - len(past_ids)) + past_ids
                 # The reserved blocks are real blocks of mem_seq, so the strip shows
                 # them between the pool and the outlined live frame.
                 _save_mem_strip(
@@ -699,6 +705,9 @@ class Gr00tN1d6ActionHead(nn.Module):
                     print(f"[mem] pool ep={key} dropped at last step {step_id}", flush=True)
 
         self._evict_zoo_pool()
+        # Labels for the blocks just stacked, read by MemoryAttentionProbe.
+        self._last_mem_step_ids = block_step_ids
+        self._last_mem_episode_ids = list(episode_ids)
         backbone_output["mem_seq"] = torch.stack(mem_seq, dim=0).view(B, K_target * n_q, d)
         return backbone_output
 

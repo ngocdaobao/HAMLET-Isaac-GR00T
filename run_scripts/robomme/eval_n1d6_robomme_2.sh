@@ -33,6 +33,11 @@ SERVER_TIMEOUT="${SERVER_TIMEOUT:-300}"
 # pool into <out>/<task>/mem_obs/ (see run_task). Rollout-only debugging aid: it writes
 # a PNG per pool slot plus a per-call strip, so leave it unset for timed runs.
 MEM_DEBUG="${GR00T_MEM_DEBUG:-}"
+# GR00T_MEM_ATTR=1 records, per policy call, which memory blocks the action head
+# actually attended to, into <out>/<task>/mem_attn/memory_attention.jsonl. Cheap enough
+# to leave on (it recomputes attention the model already ran), but it does add work per
+# call, so leave it unset for timed runs.
+MEM_ATTR="${GR00T_MEM_ATTR:-}"
 
 # Deterministic single-seed eval (flow-matching noise from a fixed generator).
 export GR00T_INFERENCE_SEED="${GR00T_INFERENCE_SEED:-6}"
@@ -66,6 +71,7 @@ run_task() {
     # The pool dump lives in the server process (the model holds the cache), and is
     # scoped to this task so consecutive tasks do not share one episode namespace.
     GR00T_MEM_DEBUG="$MEM_DEBUG" GR00T_MEM_DEBUG_DIR="$out/mem_obs" \
+    GR00T_MEM_ATTR="$MEM_ATTR" GR00T_MEM_ATTR_OUT="$out/mem_attn/memory_attention.jsonl" \
     python gr00t/eval/run_gr00t_server.py \
         --model-path "$MODEL_PATH" --embodiment-tag NEW_EMBODIMENT \
         --use-sim-policy-wrapper --host 127.0.0.1 --port "$PORT" &
@@ -108,3 +114,6 @@ if (( ${#FAILED_TASKS[@]} > 0 )); then
     exit 1
 fi
 echo "[eval] done. Aggregate with: python gr00t/eval/sim/robomme/aggregate_eval_summary.py $OUTPUT_DIR"
+if [ -n "$MEM_ATTR" ]; then
+    echo "[eval] memory attention: python gr00t/eval/sim/robomme/aggregate_mem_attention.py $OUTPUT_DIR"
+fi

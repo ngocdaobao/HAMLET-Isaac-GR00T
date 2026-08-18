@@ -60,9 +60,17 @@ class MemoryStepAttribution:
     score: float  # share of the action head's memory attention, sums to 1 over blocks
     is_current: bool  # the live observation (always the last block)
     is_padding: bool  # warm-up duplicate: the pool had no distinct block for this slot
+    # Which kind of slot of `mem_seq` this is. zoo lays the window out as
+    # selected(K-m) + recent(m-1) + current, so a block is "pool" (won its way in
+    # through the admission contest), "recent" (a reserved recency slot, admitted to
+    # nothing) or "current" (the live observation). The rolling FIFO has no such
+    # structure and is all "window" + "current".
+    slot_kind: str = "pool"
 
     def __repr__(self) -> str:  # compact, these get printed in rollout loops
-        tag = "*" if self.is_current else ("~" if self.is_padding else " ")
+        tag = {"current": "*", "recent": ">"}.get(self.slot_kind, " ")
+        if self.is_padding:
+            tag = "~"
         return f"{tag}b{self.block_index}(step={self.step_id}):{self.score:.3f}"
 
 
@@ -80,15 +88,21 @@ class MemoryAttributionReport:
     n_q: int
     window: int
 
-    def top(self, k: int = 1, exclude_current: bool = True) -> list[MemoryStepAttribution]:
-        """The k highest-scoring blocks, best first.
+    def top(self, k: int = 1, exclude_current: bool = False) -> list[MemoryStepAttribution]:
+        """The k highest-scoring blocks of `mem_seq`, best first.
 
-        The live observation is excluded by default: it is in `mem_seq` but it is not a
-        pooled memory, and it usually dominates (the memory transformer's own block is
-        the one place every current token can attend without crossing a block).
+        Every slot competes by default -- selected, reserved-recent and the live
+        observation alike -- because the question the ranking answers is "which step
+        does the memory transformer make the action read", and the answer "the current
+        one" is a real (and diagnostic) answer: it means the window is contributing
+        nothing the current frame does not already carry.
+
+        `exclude_current=True` restricts it to steps that are actually memory, which is
+        the right view when comparing pooling strategies rather than measuring whether
+        memory is used at all.
         """
-        pool = [s for s in self.steps if not (exclude_current and s.is_current)]
-        return sorted(pool, key=lambda s: s.score, reverse=True)[:k]
+        blocks = [s for s in self.steps if not (exclude_current and s.is_current)]
+        return sorted(blocks, key=lambda s: s.score, reverse=True)[:k]
 
     @property
     def best(self) -> MemoryStepAttribution | None:
@@ -148,6 +162,7 @@ class MemoryAttentionProbe:
         self.window = int(self.memory_transformer.T)
         self.mem_cond_type = getattr(action_head, "mem_cond_type", "cross_attn")
         self.memory_mode = getattr(action_head, "memory_mode", "window")
+        self.slot_kinds = self._slot_kinds()
 
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         # Per-call buffers, cleared when the memory transformer starts a new forward.
@@ -156,6 +171,23 @@ class MemoryAttentionProbe:
         self._mass: torch.Tensor | None = None  # (B,) prob. mass on memory per xattn call
         self._n_xattn = 0
         self._pending: list[dict] = []  # reports queued for dump_jsonl
+
+    def _slot_kinds(self) -> list[str]:
+        """Label each block of `mem_seq` by the role it plays in the window.
+
+        Mirrors the layout `process_mem_cache` stacks: `selected(K-m) + recent(m-1) +
+        [current]`, with `m = zoo_recent_slots` clamped to [1, K]. The reserved-recent
+        slots are NOT pool decisions -- they are handed the last m-1 observations
+        unconditionally -- so a ranking that does not separate them from selected blocks
+        credits the pool for attention it never chose.
+        """
+        T = self.window
+        if self.memory_mode != "zoo":
+            return ["window"] * (T - 1) + ["current"]
+        cfg = getattr(self.action_head, "config", None)
+        m = max(1, min(int(getattr(cfg, "zoo_recent_slots", 2)), T))
+        cap = T - m  # selected slots
+        return ["pool"] * cap + ["recent"] * (T - 1 - cap) + ["current"]
 
     # ---------------------------------------------------------------- attach / detach
 
@@ -375,6 +407,7 @@ class MemoryAttentionProbe:
                         score=float(scores[b, i]),
                         is_current=is_current,
                         is_padding=is_pad,
+                        slot_kind=self.slot_kinds[i],
                     )
                 )
             reports.append(
@@ -389,7 +422,7 @@ class MemoryAttentionProbe:
                     n_q=n_q,
                     window=T,
                 )
-            )
+            ) 
         self._pending = [r.to_dict() for r in reports]
         return reports
 
