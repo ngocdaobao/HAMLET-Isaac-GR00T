@@ -51,6 +51,12 @@ import torch
 from gr00t.model.modules.memory import MemoryTransformer, _apply_rope
 
 
+def _safe_name(value: Any) -> str:
+    """Filesystem-safe file stem for a session/episode id (they come from the client)."""
+    s = str(value) if value is not None else "unknown"
+    return "".join(c if (c.isalnum() or c in "-_.") else "_" for c in s)[:128] or "unknown"
+
+
 @dataclass
 class MemoryStepAttribution:
     """One block of `mem_seq`, i.e. one step the pool is holding."""
@@ -442,21 +448,42 @@ class MemoryAttentionProbe:
 
     # -------------------------------------------------------------------- convenience
 
-    def dump_jsonl(self, path: str, extra: dict | list[dict] | None = None) -> None:
-        """Append the last `report()` (one JSON object per batch row) to `path`.
+    def dump_jsonl(
+        self,
+        path: str,
+        extra: dict | list[dict] | None = None,
+        split_by: str | None = None,
+    ) -> None:
+        """Append the last `report()` (one JSON object per batch row) to disk.
 
         `extra` merges caller fields into the rows -- a dict for all of them, or a list
         aligned with the batch (e.g. the session id and call index of each row).
+
+        `split_by` names a row field to shard on: `path` is then a DIRECTORY and each row
+        lands in `<path>/<row[split_by]>.jsonl`. Sharding by session keeps one episode
+        per file, which is what makes a per-episode summary a matter of reading one file
+        rather than filtering a task-wide log.
         """
         if not self._pending:
             return
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "a") as f:
-            for i, row in enumerate(self._pending):
-                if isinstance(extra, dict):
-                    row = {**row, **extra}
-                elif extra is not None and i < len(extra):
-                    row = {**row, **extra[i]}
+        rows = []
+        for i, row in enumerate(self._pending):
+            if isinstance(extra, dict):
+                row = {**row, **extra}
+            elif extra is not None and i < len(extra):
+                row = {**row, **extra[i]}
+            rows.append(row)
+
+        if split_by is None:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, "a") as f:
+                for row in rows:
+                    f.write(json.dumps(row, default=str) + "\n")
+            return
+
+        os.makedirs(path, exist_ok=True)
+        for row in rows:
+            with open(os.path.join(path, f"{_safe_name(row.get(split_by))}.jsonl"), "a") as f:
                 f.write(json.dumps(row, default=str) + "\n")
 
 

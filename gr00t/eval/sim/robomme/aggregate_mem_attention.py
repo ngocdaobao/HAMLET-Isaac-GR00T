@@ -13,7 +13,10 @@ evidence the pool selected well.
     mass        mean probability the action tokens put on the memory tokens at all.
                 Near zero means memory is barely being used (or the key-moment gate
                 zeroed it), and the rest of the row says little.
-    won         how often each slot took the argmax, oldest slot first.
+    won         in how many EPISODES each slot led, oldest slot first -- an episode
+                votes once, for the block with its highest mean score, so the counts sum
+                to the episode count and a long rollout cannot outvote several short
+                ones.
     mean        each slot's mean score over ALL calls, not just the ones it won -- a
                 slot can matter steadily without ever taking the argmax, which `won`
                 alone hides.
@@ -94,6 +97,19 @@ def summarize(rows: list[dict]) -> dict:
     ages = [_age(r, w) for r, w in wins if not w["is_current"]]
     ages = [a for a in ages if a is not None]
     kinds = [w.get("slot_kind", "pool") for _, w in wins]
+    # Episodes won: each episode is scored by its own mean per block and contributes one
+    # vote, to the block that leads it. Call-level counting lets a long rollout outvote
+    # nine short ones; this asks instead "in how many episodes was this block the one the
+    # action head read most", which is the question a per-episode file layout implies.
+    by_ep: dict[str, dict[int, list[float]]] = {}
+    for r in rows:
+        ep = r.get("session_id") or r.get("episode_id")
+        slot = by_ep.setdefault(ep, {})
+        for st in r["steps"]:
+            slot.setdefault(st["block_index"], []).append(st["score"])
+    ep_wins = Counter(
+        max(slot, key=lambda i: statistics.fmean(slot[i])) for slot in by_ep.values()
+    )
     # Mean score of each slot over ALL calls (not just the ones it won): a slot can
     # matter steadily without ever taking the argmax.
     per_slot: dict[int, list[float]] = {}
@@ -105,6 +121,8 @@ def summarize(rows: list[dict]) -> dict:
         "episodes": len({r.get("session_id") or r.get("episode_id") for r in rows}),
         "mass": statistics.fmean(r["memory_attention_mass"] for r in rows),
         "slots": Counter(w["block_index"] for _, w in wins),
+        "ep_wins": ep_wins,
+        "n_ep": len(by_ep),
         "slot_mean": {i: statistics.fmean(v) for i, v in per_slot.items()},
         "kinds": Counter(kinds),
         "kind_of": {s["block_index"]: s.get("slot_kind", "pool") for s in rows[0]["steps"]},
@@ -125,7 +143,7 @@ def _fmt(task: str, s: dict) -> list[str]:
     n = sum(s["slots"].values())
     idx = range(s["window"])
     tags = [_KIND_TAG.get(s["kind_of"].get(i, "pool"), "?") for i in idx]
-    won = "  ".join(f"b{i}{t}:{100 * s['slots'].get(i, 0) / n:5.1f}%" for i, t in zip(idx, tags))
+    won = "  ".join(f"b{i}{t}:{s['ep_wins'].get(i, 0):>3}" for i, t in zip(idx, tags))
     mean = "  ".join(f"b{i}{t}:{100 * s['slot_mean'].get(i, 0.0):5.1f}%" for i, t in zip(idx, tags))
     kinds = "  ".join(
         f"{k}:{100 * v / n:.1f}%" for k, v in sorted(s["kinds"].items(), key=lambda kv: -kv[1])
@@ -133,7 +151,7 @@ def _fmt(task: str, s: dict) -> list[str]:
     return [
         f"[{task}] calls={s['calls']} episodes={s['episodes']} "
         f"mass={s['mass']:.4f} src={s['source']}   (P=pooled R=recent C=current)",
-        f"    won    {won}",
+        f"    won    {won}   (episodes, {s['n_ep']} total)",
         f"    mean   {mean}",
         f"    winner {kinds}",
         (
@@ -146,36 +164,106 @@ def _fmt(task: str, s: dict) -> list[str]:
     ]
 
 
-def main(run_dir: str) -> None:
-    run = Path(run_dir)
-    single = run / "mem_attn" / "memory_attention.jsonl"
-    if single.is_file():  # pointed at one task directory
-        found = {run.name: _rows(single)}
+def _episodes(task_dir: Path) -> dict[str, list[dict]]:
+    """{episode -> its calls}, one entry per `<task>/mem_attn/<session_id>.jsonl`."""
+    mem = task_dir / "mem_attn"
+    if not mem.is_dir():
+        return {}
+    out = {}
+    for p in sorted(mem.glob("*.jsonl")):
+        rows = _rows(p)
+        if rows:
+            out[p.stem] = sorted(rows, key=lambda r: r.get("call_index", 0))
+    return out
+
+
+def _episode_table(per_ep: dict[str, list[dict]], task_s: dict) -> list[str]:
+    """One row per episode: its own mean over its own calls.
+
+    Episodes differ in length by more than an order of magnitude (an early success ends
+    in a handful of calls, a timeout runs to MAX_EP_STEPS), and the task line pools calls
+    flat -- so it is dominated by the long ones. This table is the per-episode view that
+    pooling hides, plus a macro mean that weights every episode equally.
+    """
+    idx = range(task_s["window"])
+    tags = [_KIND_TAG.get(task_s["kind_of"].get(i, "pool"), "?") for i in idx]
+    head = "  ".join(f"{f'b{i}{t}':>6}" for i, t in zip(idx, tags))
+    lines = [
+        f"    {'episode':<34} {'calls':>6} {'mass':>7}  {head}  "
+        f"{'top-kind':<13} {'age':>5}"
+    ]
+
+    macro: dict[int, list[float]] = {i: [] for i in idx}
+    for ep, rows in per_ep.items():
+        s = summarize(rows)
+        if not s:
+            continue
+        means = "  ".join(f"{100 * s['slot_mean'].get(i, 0.0):5.1f}%" for i in idx)
+        for i in idx:
+            macro[i].append(s["slot_mean"].get(i, 0.0))
+        kind, cnt = s["kinds"].most_common(1)[0]
+        age = f"{s['age_mean']:.0f}" if s["age_n"] else "--"
+        share = f"{kind[:7]} {100 * cnt / sum(s['kinds'].values()):.0f}%"
+        lines.append(
+            f"    {ep[:34]:<34} {s['calls']:>6} {s['mass']:>7.4f}  {means}  "
+            f"{share:<13} {age:>5}"
+        )
+    if macro[0]:
+        avg = "  ".join(f"{100 * statistics.fmean(macro[i]):5.1f}%" for i in idx)
+        lines.append(f"    {'mean over episodes (macro)':<34} {'':>6} {'':>7}  {avg}")
+    return lines
+
+
+def _task_report(task: str, per_ep: dict[str, list[dict]]) -> str:
+    rows = [r for v in per_ep.values() for r in v]
+    s = summarize(rows)
+    if not s:
+        return f"[{task}] no scoreable calls\n"
+    lines = [f"Memory-attention attribution: {task}", ""]
+    lines += _fmt(task, s)
+    lines += ["", f"    per-episode ({len(per_ep)} episodes)"]
+    lines += _episode_table(per_ep, s)
+    return "\n".join(lines) + "\n"
+
+
+def main(target: str) -> None:
+    """`target` is a run dir (all tasks) or a single `<run>/<TASK>` dir."""
+    root = Path(target)
+    if (root / "mem_attn").is_dir():  # pointed at one task
+        tasks = {root.name: root}
     else:
-        found = {}
-        for t in TASKS:
-            p = run / t / "mem_attn" / "memory_attention.jsonl"
-            if p.is_file():
-                found[t] = _rows(p)
-    if not found:
-        print(f"[!] no memory_attention.jsonl under {run} — was GR00T_MEM_ATTR=1 set?")
+        tasks = {t: root / t for t in TASKS if (root / t / "mem_attn").is_dir()}
+    if not tasks:
+        print(f"[!] no mem_attn/*.jsonl under {root} — was GR00T_MEM_ATTR=1 set?")
         sys.exit(1)
 
-    lines = [f"Memory-attention attribution: {run}", ""]
-    for task, rows in found.items():
-        s = summarize(rows)
-        lines += _fmt(task, s) if s else [f"[{task}] no scoreable calls"]
-        lines.append("")
-    pooled = [r for rows in found.values() for r in rows]
-    s = summarize(pooled)
-    if s:
-        lines += _fmt(f"ALL ({len(found)} tasks)", s)
+    found = {}
+    for task, task_dir in tasks.items():
+        per_ep = _episodes(task_dir)
+        if not per_ep:
+            continue
+        found[task] = per_ep
+        report = _task_report(task, per_ep)
+        out = task_dir / "mem_attention_report.txt"
+        out.write_text(report)
+        print(report)
+        print(f"[i] wrote {out}\n")
 
-    summary = "\n".join(lines)
-    print(summary)
-    out = run / "mem_attention_summary.txt"
-    out.write_text(summary + "\n")
-    print(f"\n[i] wrote {out}")
+    if len(found) > 1:  # run-level rollup across the tasks that have logs
+        pooled = [r for per_ep in found.values() for v in per_ep.values() for r in v]
+        s = summarize(pooled)
+        if s:
+            lines = [f"Memory-attention attribution: {root}", ""]
+            for task, per_ep in found.items():
+                ts = summarize([r for v in per_ep.values() for r in v])
+                if ts:
+                    lines += _fmt(task, ts) + [""]
+            lines += _fmt(f"ALL ({len(found)} tasks)", s)
+            summary = "\n".join(lines)
+            print(summary)
+            out = root / "mem_attention_summary.txt"
+            out.write_text(summary + "\n")
+            print(f"\n[i] wrote {out}")
 
 
 if __name__ == "__main__":

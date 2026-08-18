@@ -26,7 +26,15 @@ _MEM_DEBUG = bool(os.environ.get("GR00T_MEM_DEBUG"))
 # policy call. GR00T_MEM_ATTR_OUT overrides the destination; summarize with
 # gr00t/eval/sim/robomme/aggregate_mem_attention.py.
 _MEM_ATTR = bool(os.environ.get("GR00T_MEM_ATTR"))
-_MEM_ATTR_OUT = os.environ.get("GR00T_MEM_ATTR_OUT", "mem_attn/memory_attention.jsonl")
+# Destination DIRECTORY: one JSONL per episode, <dir>/<session_id>.jsonl. The eval script
+# points it at <out>/<task>/mem_attn so a task's episodes sit together and its report can
+# be written from them when the task ends. GR00T_MEM_ATTR_OUT is accepted as an alias;
+# a value ending in .jsonl is reduced to its directory.
+_MEM_ATTR_DIR = (
+    os.environ.get("GR00T_MEM_ATTR_DIR") or os.environ.get("GR00T_MEM_ATTR_OUT") or "mem_attn"
+)
+if _MEM_ATTR_DIR.endswith(".jsonl"):
+    _MEM_ATTR_DIR = os.path.dirname(_MEM_ATTR_DIR) or "."
 
 
 def _rec_to_dtype(x: Any, dtype: torch.dtype) -> Any:
@@ -139,7 +147,10 @@ class Gr00tPolicy(BasePolicy):
 
             try:
                 self._mem_probe = MemoryAttentionProbe(self.model.action_head).attach()
-                print(f"[mem-attr] probe attached, writing {_MEM_ATTR_OUT}", flush=True)
+                print(
+                    f"[mem-attr] probe attached, writing {_MEM_ATTR_DIR}/<session_id>.jsonl",
+                    flush=True,
+                )
             except ValueError as e:
                 # No memory transformer on this checkpoint -- nothing to attribute.
                 print(f"[mem-attr] disabled: {e}", flush=True)
@@ -156,8 +167,8 @@ class Gr00tPolicy(BasePolicy):
         """Append one row per batch sample ranking the memory blocks the action read.
 
         Each row carries the score of every block of `mem_seq` (they sum to 1), so the
-        winner is the pooled step this action attended to most. `session_id` and
-        `call_index` locate the call inside its episode.
+        winner is the pooled step this action attended to most. Rows are sharded by
+        session, one JSONL per episode, and `call_index` orders them inside it.
         """
         reports = self._mem_probe.report()
         if not reports:
@@ -168,7 +179,7 @@ class Gr00tPolicy(BasePolicy):
             n = self._mem_attr_calls.get(sid, 0)
             self._mem_attr_calls[sid] = n + 1
             extra.append({"session_id": sid, "call_index": n})
-        self._mem_probe.dump_jsonl(_MEM_ATTR_OUT, extra=extra)
+        self._mem_probe.dump_jsonl(_MEM_ATTR_DIR, extra=extra, split_by="session_id")
         if _MEM_DEBUG:
             for r in reports:
                 print(r.summary(), flush=True)

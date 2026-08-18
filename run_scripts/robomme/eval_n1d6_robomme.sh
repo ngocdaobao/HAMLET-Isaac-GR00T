@@ -32,9 +32,11 @@ SERVER_TIMEOUT="${SERVER_TIMEOUT:-300}"
 # a PNG per pool slot plus a per-call strip, so leave it unset for timed runs.
 MEM_DEBUG="${GR00T_MEM_DEBUG:-}"
 # GR00T_MEM_ATTR=1 records, per policy call, which memory blocks the action head
-# actually attended to, into <out>/<task>/mem_attn/memory_attention.jsonl. Cheap enough
-# to leave on (it recomputes attention the model already ran), but it does add work per
-# call, so leave it unset for timed runs.
+# actually attended to: one JSONL per episode in <out>/<task>/mem_attn/, plus
+# <out>/<task>/mem_attention_report.txt + mem_attention_scores.png + per-episode plots,
+# written by run_task when the task ends. Cheap enough to leave on (it recomputes
+# attention the model already ran), but it does add work per call, so leave it unset
+# for timed runs.
 MEM_ATTR="${GR00T_MEM_ATTR:-}"
 
 # Deterministic single-seed eval (flow-matching noise from a fixed generator).
@@ -69,7 +71,7 @@ run_task() {
     # The pool dump lives in the server process (the model holds the cache), and is
     # scoped to this task so consecutive tasks do not share one episode namespace.
     GR00T_MEM_DEBUG="$MEM_DEBUG" GR00T_MEM_DEBUG_DIR="$out/mem_obs" \
-    GR00T_MEM_ATTR="$MEM_ATTR" GR00T_MEM_ATTR_OUT="$out/mem_attn/memory_attention.jsonl" \
+    GR00T_MEM_ATTR="$MEM_ATTR" GR00T_MEM_ATTR_DIR="$out/mem_attn" \
     python gr00t/eval/run_gr00t_server.py \
         --model-path "$MODEL_PATH" --embodiment-tag NEW_EMBODIMENT \
         --use-sim-policy-wrapper --host 127.0.0.1 --port "$PORT" &
@@ -99,6 +101,15 @@ run_task() {
     if [ ! -s "$out/simulation_results.csv" ]; then
         echo "[eval] ERROR: $task - rollout produced no simulation_results.csv" >&2
         return 1
+    fi
+    # Task is over and the server is down, so every episode's JSONL is complete: write
+    # this task's attribution report now rather than leaving it to a manual pass. Never
+    # fails the task -- the eval result does not depend on it.
+    if [ -n "$MEM_ATTR" ]; then
+        python gr00t/eval/sim/robomme/aggregate_mem_attention.py "$out" \
+            || echo "[eval] WARN: $task - mem-attr report failed" >&2
+        python gr00t/eval/sim/robomme/plot_mem_attention.py "$out" \
+            || echo "[eval] WARN: $task - mem-attr plots failed" >&2
     fi
 }
 
