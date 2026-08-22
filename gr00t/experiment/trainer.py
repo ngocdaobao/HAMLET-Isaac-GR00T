@@ -190,13 +190,33 @@ class Gr00tTrainer(Trainer):
         """
         self.action_offset = kwargs.pop("action_offset", None)
         self.multiprocessing_context = kwargs.pop("multiprocessing_context", "fork")
+        # Auxiliary scalars the model reports alongside `loss` (memory grounding: the
+        # plain flow MSE, the hinge, the mismatched-memory MSE). Summed on-device over
+        # every micro-batch since the last log so no per-step host sync is added, then
+        # averaged and merged into the `loss` log line.
+        self._aux_sums: dict[str, torch.Tensor] = {}
+        self._aux_count = 0
         super().__init__(
             *args,
             **kwargs,
             # compute_metrics=partial(compute_eval_accuracy, action_offset=self.action_offset),
         )
 
+    # Reported next to `loss` when the model emits them; see Gr00tN1d6ActionHead.forward.
+    AUX_LOG_KEYS = ("mse_loss", "mem_ground_loss", "mse_r")
+
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        # Merge the accumulated auxiliary scalars into the training-loss line (rather
+        # than emitting a second line) so mse / hinge read directly against `loss`.
+        # These are this rank's own micro-batches, NOT all-reduced like `loss`: the
+        # keys present can differ per rank (a rank whose last batch is B==1 builds no
+        # mismatched-memory pass), and a collective here would then hang.
+        if "loss" in logs and self._aux_count:
+            for key, total in self._aux_sums.items():
+                logs[key] = round(float(total) / self._aux_count, 6)
+            self._aux_sums = {}
+            self._aux_count = 0
+
         # Hide epoch from logged metrics as it's misleading for Iterable datasets.
         epoch = self.state.epoch
         self.state.epoch = None
@@ -301,6 +321,21 @@ class Gr00tTrainer(Trainer):
 
         # Record last loss for testing purposes.
         self.loss = loss
+
+        # Stash the model's auxiliary scalars for the next `loss` log line. Kept as
+        # device tensors and summed here so the accumulation costs no host sync; the
+        # single .item() happens in `log`.
+        if model.training and hasattr(outputs, "get"):
+            found = False
+            for key in self.AUX_LOG_KEYS:
+                value = outputs.get(key)
+                if value is None:
+                    continue
+                value = value.detach()
+                self._aux_sums[key] = self._aux_sums.get(key, 0) + value
+                found = True
+            if found:
+                self._aux_count += 1
 
         # --------------------------------------------------------------
         # Accuracy calculation

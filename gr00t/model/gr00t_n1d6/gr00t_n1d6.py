@@ -1416,7 +1416,6 @@ class Gr00tN1d6ActionHead(nn.Module):
             outputs["mem_ground_loss"] = ground_loss.detach()
             # Logged so the gap can be watched directly: mse_r should pull away from mse.
             outputs["mse_r"] = ((mse_r_per_row * valid).sum() / n_valid).detach()
-            outputs["mem_ground_rows"] = valid.sum().detach()
 
         return outputs
 
