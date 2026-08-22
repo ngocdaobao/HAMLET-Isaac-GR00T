@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # GR00T N1.6 + HAMLET "zoo" fine-tune -- history-aware policy with a cross-iteration
 # memory pool instead of a within-batch memory window.
-# Usage: VIZ_BATCH_DIR=runs/robomme DATASET_PATH=data/robomme bash run_scripts/robomme/train_zoo_n1d6_fix_dataloader.sh
+# Usage: VIZ_BATCH_DIR=runs/robomme DATASET_PATH=data/robomme bash run_scripts/robomme/train_zoo_n1d6_mal.sh
 #   RoboMME modality (8-D abs-joint / 2-view) is preset (robomme_config.py).
 #
 # How zoo differs from the original HAMLET window (--memory-mode window):
@@ -38,7 +38,7 @@ cd "$REPO_ROOT"
 # config (override via env)
 DATASET_PATH="${DATASET_PATH:?set DATASET_PATH to your benchmark dataset directory}"
 MODALITY_CONFIG="${MODALITY_CONFIG:-gr00t/configs/data/robomme_config.py}"  # robomme_config.py | rmbench_config.py
-OUTPUT_DIR="${OUTPUT_DIR:-runs/robomme/zoo_n1d6_fix_dataloader_lr_5e_5}"  # where to save checkpoints and logs
+OUTPUT_DIR="${OUTPUT_DIR:-runs/robomme/zoo_n1d6_mal}"  # where to save checkpoints and logs
 BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.6-3B}"
 NUM_GPUS="${NUM_GPUS:-4}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
