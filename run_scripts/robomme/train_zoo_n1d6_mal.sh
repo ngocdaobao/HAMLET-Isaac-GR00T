@@ -43,8 +43,8 @@ BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.6-3B}"
 NUM_GPUS="${NUM_GPUS:-4}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"                  # zoo forwards 1 obs/row regardless of K, so this need not scale with K
-MAX_STEPS="${MAX_STEPS:-60000}"
-SAVE_STEPS="${SAVE_STEPS:-60000}"
+MAX_STEPS="${MAX_STEPS:-300}"
+SAVE_STEPS="${SAVE_STEPS:-300}"
 MASTER_PORT="${MASTER_PORT:-$(( 20000 + RANDOM % 10000 ))}"
 
 # The compute nodes have no outbound network, so wandb cannot be the run record --
@@ -106,7 +106,7 @@ DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-5}"
 
 # memory adherence loss 
 MEM_GROUND_WEIGHT="${MEM_GROUND_WEIGHT:-0.1}"  # weight on the hinge loss that penalizes memory drift
-MEM_GROUND_MARGIN="${MEM_GROUND_MARGIN:-0.1}"  # margin for the
+MEM_GROUND_MARGIN="${MEM_GROUND_MARGIN:-0.01}"  # margin for the
 
 
 # Memory pool selection hyperparameters (see gr00t_n1d6.py _pool_density)
