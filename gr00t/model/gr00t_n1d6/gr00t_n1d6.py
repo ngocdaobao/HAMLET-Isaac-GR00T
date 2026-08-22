@@ -1233,8 +1233,8 @@ class Gr00tN1d6ActionHead(nn.Module):
         """
         # Set frozen modules to eval
 
-        logging.info(f"MAL: WEIGHT: {self.mem_ground_weight}")
-        logging.info(f"MAL: MARGIN: {self.mem_ground_margin}")
+        # logging.info(f"MAL: WEIGHT: {self.mem_ground_weight}")
+        # logging.info(f"MAL: MARGIN: {self.mem_ground_margin}")
 
         self.set_frozen_modules_to_eval_mode()
 

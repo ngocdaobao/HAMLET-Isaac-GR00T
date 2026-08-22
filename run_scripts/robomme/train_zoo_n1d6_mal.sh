@@ -43,8 +43,8 @@ BASE_MODEL="${BASE_MODEL:-nvidia/GR00T-N1.6-3B}"
 NUM_GPUS="${NUM_GPUS:-4}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"                  # zoo forwards 1 obs/row regardless of K, so this need not scale with K
-MAX_STEPS="${MAX_STEPS:-300}"
-SAVE_STEPS="${SAVE_STEPS:-300}"
+MAX_STEPS="${MAX_STEPS:-60000}"
+SAVE_STEPS="${SAVE_STEPS:-60000}"
 MASTER_PORT="${MASTER_PORT:-$(( 20000 + RANDOM % 10000 ))}"
 
 # The compute nodes have no outbound network, so wandb cannot be the run record --
@@ -93,8 +93,8 @@ ANCHOR_STRIDE="${ANCHOR_STRIDE:-$MEMORY_STRIDE}"
 # order and every slot in a batch ends up on the SAME episode. With ANCHOR_STRIDE=16 a
 # 1024-anchor shard holds ~34 episodes for RoboMME (mean 481 steps), comfortably above 8.
 
-ANCHOR_PHASES="${ANCHOR_PHASES:-5}"  # number of anchor phases (for multi-phase anchor streams, e.g. RoboMME's 2-view)
-ANCHOR_CHUNK_SIZE="${ANCHOR_CHUNK_SIZE:-20}"  # number of consecutive anchors per phase (for multi-phase anchor streams, e.g. RoboMME's 2-view)
+ANCHOR_PHASES="${ANCHOR_PHASES:-3}"  # number of anchor phases (for multi-phase anchor streams, e.g. RoboMME's 2-view)
+ANCHOR_CHUNK_SIZE="${ANCHOR_CHUNK_SIZE:-30}"  # number of consecutive anchors per phase (for multi-phase anchor streams, e.g. RoboMME's 2-view)
 SHARD_SIZE="${SHARD_SIZE:-1024}"
 # >1 worker round-robins whole batches across workers reading disjoint shards, so slot i
 # at iteration t+1 would not follow slot i at iteration t. Keep at 1 in sequential mode.
@@ -107,6 +107,7 @@ DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-5}"
 # memory adherence loss 
 MEM_GROUND_WEIGHT="${MEM_GROUND_WEIGHT:-0.1}"  # weight on the hinge loss that penalizes memory drift
 MEM_GROUND_MARGIN="${MEM_GROUND_MARGIN:-0.01}"  # margin for the
+MEM_GROUP_SHUFFLE="${MEM_GROUP_SHUFFLE:-block_perm}"  
 
 
 # Memory pool selection hyperparameters (see gr00t_n1d6.py _pool_density)

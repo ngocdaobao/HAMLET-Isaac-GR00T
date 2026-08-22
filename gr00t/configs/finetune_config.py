@@ -317,7 +317,7 @@ class FinetuneConfig:
     `mse_loss`: a margin far above it saturates the hinge and the gradient just fights
     the main objective. Start around 5-20% of the running mse."""
 
-    mem_ground_shuffle: Literal["batch_roll", "block_perm", "both"] = "batch_roll"
+    mem_ground_shuffle: Literal["batch_roll", "block_perm", "both"] = "block_perm"
     """How the mismatched memory window is built.
 
     "batch_roll": each row is handed another batch row's window -- a different episode
