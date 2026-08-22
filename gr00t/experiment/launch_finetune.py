@@ -120,6 +120,32 @@ if __name__ == "__main__":
     config.model.zoo_recent_slots = ft_config.zoo_recent_slots
     config.model.use_key_moment_gate = ft_config.use_key_moment_gate
     config.model.delta_threshold = ft_config.delta_threshold
+    config.model.mem_ground_weight = ft_config.mem_ground_weight
+    config.model.mem_ground_margin = ft_config.mem_ground_margin
+    config.model.mem_ground_shuffle = ft_config.mem_ground_shuffle
+    if ft_config.mem_ground_weight > 0:
+        if ft_config.hamlet_mode != "finetune":
+            raise ValueError(
+                f"mem_ground_weight={ft_config.mem_ground_weight} needs hamlet_mode="
+                f"'finetune' (there is no memory to mismatch under "
+                f"hamlet_mode={ft_config.hamlet_mode!r})."
+            )
+        # A shuffle that cannot change anything makes the term a silent no-op for the
+        # whole run. memory_window is known here; the per-device batch size is not
+        # (it is derived from global_batch_size and the world size), so 'batch_roll'
+        # is checked at runtime by Gr00tN1d6ActionHead instead.
+        if ft_config.mem_ground_shuffle == "block_perm" and ft_config.memory_window <= 2:
+            raise ValueError(
+                f"mem_ground_shuffle='block_perm' reorders the past blocks of the "
+                f"window, so it needs memory_window > 2 (got "
+                f"{ft_config.memory_window}; only the current block would be left). "
+                f"Use 'batch_roll' instead."
+            )
+        print(
+            f"[HAMLET] memory grounding: weight={ft_config.mem_ground_weight} "
+            f"margin={ft_config.mem_ground_margin} "
+            f"shuffle={ft_config.mem_ground_shuffle}"
+        )
     if (
         ft_config.hamlet_mode == "finetune"
         and ft_config.freeze_moment_tokens

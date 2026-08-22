@@ -143,6 +143,24 @@ class Gr00tN1d6Config(PretrainedConfig):
     # True: a candidate competes only with pool blocks in its own temporal bucket, so
     # coverage of the episode is structural. False: original global-argmin eviction.
     zoo_stratified: bool = True
+    # Memory-grounding auxiliary loss (RA-VLA's mse_r / margin, with HAMLET memory in
+    # place of RA-VLA's retrieved neighbours). The action head runs the DiT a second
+    # time on the SAME noised trajectory with a mismatched memory window and requires
+    # that pass to be at least `mem_ground_margin` worse in per-sample flow MSE:
+    #     loss = mse + mem_ground_weight * relu(mem_ground_margin - (mse_r - mse))
+    # A policy that ignores memory scores identically in both passes and pays the full
+    # margin, so the gap can only be earned by actually reading memory.
+    # 0 disables the second pass entirely (no extra compute). Training-only.
+    mem_ground_weight: float = 0.0
+    mem_ground_margin: float = 0.0
+    # How the mismatched memory window is built:
+    #   "batch_roll": row i is given another batch row's window -- wrong episode
+    #       entirely (this is what RA-VLA does to its retrieved set). Needs B > 1.
+    #   "block_perm": the row's own past blocks in a random chronological order, with
+    #       the current observation left in place. Grounds temporal structure rather
+    #       than content. Needs memory_window > 2.
+    #   "both": permute chronology and swap rows.
+    mem_ground_shuffle: str = "batch_roll"
     # Key-moment gate: when True, memory is zeroed out on non-key-moment steps
     # (window-end joint-state delta >= delta_threshold). When False, memory is
     # never gated -> plain HAMLET. Persisted to the checkpoint config so eval

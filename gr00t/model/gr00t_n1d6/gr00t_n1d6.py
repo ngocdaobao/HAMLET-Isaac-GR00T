@@ -288,6 +288,21 @@ class Gr00tN1d6ActionHead(nn.Module):
         else:
             self.mem_adaln_pool = None
 
+        # Memory grounding (RA-VLA mse_r + hinge). See `_mem_grounding_on`.
+        self.mem_ground_weight = float(getattr(config, "mem_ground_weight", 0.0))
+        self.mem_ground_margin = float(getattr(config, "mem_ground_margin", 0.0))
+        self.mem_ground_shuffle = getattr(config, "mem_ground_shuffle", "batch_roll")
+        if self.mem_ground_shuffle not in ("batch_roll", "block_perm", "both"):
+            raise ValueError(
+                f"mem_ground_shuffle must be one of batch_roll/block_perm/both, "
+                f"got {self.mem_ground_shuffle!r}"
+            )
+        if self.mem_ground_weight > 0:
+            print(
+                f"Memory grounding: weight={self.mem_ground_weight} "
+                f"margin={self.mem_ground_margin} shuffle={self.mem_ground_shuffle}"
+            )
+
         self.set_trainable_parameters(
             config.tune_projector, config.tune_diffusion_model, config.tune_vlln
         )
@@ -738,6 +753,166 @@ class Gr00tN1d6ActionHead(nn.Module):
                 _clear_cached_obs(key)
 
 
+    # ---------------------------------------------------------------- memory splice
+    # The three training-time memory paths (zoo, window/moment_token, window/
+    # vision_feature) all end the same way: aggregate a memory sequence into n_q
+    # current-step tokens, then splice those into the action-head conditioning. That
+    # tail is factored out here because the grounding loss has to run it TWICE per
+    # batch -- once on the real memory and once on a mismatched window -- and the two
+    # passes are only comparable if nothing but the memory tokens differs between them.
+
+    def _memory_tokens(
+        self,
+        mem_seq: torch.Tensor,  # (B, K*n_q, d), oldest block first
+        n_q: int,
+        mask_key_moment: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Aggregate one memory sequence into the (B, n_q, d) current-step memory."""
+        mem_aug = self.memory_transformer(mem_seq)[:, -n_q:, :]
+        if mask_key_moment is not None:
+            mem_aug = mask_key_moment.view(-1, 1, 1).to(mem_aug.dtype) * mem_aug
+        return mem_aug
+
+    def _condition_on_memory(
+        self,
+        features: torch.Tensor,  # (B, S, d) current-step backbone output, pre-splice
+        am: torch.Tensor | None,  # (B, S) backbone attention mask
+        im: torch.Tensor | None,  # (B, S) image mask
+        mem_aug: torch.Tensor,  # (B, n_mem, d)
+        mask_key_moment: torch.Tensor | None,
+        n_strip: int,
+    ):
+        """Splice `mem_aug` into the action-head conditioning.
+
+        `n_strip` trailing tokens of `features` are the slots memory takes over (n_q for
+        the moment-token paths, whose tail is the raw moment tokens); 0 means memory is
+        appended instead (vision_feature, whose tail is real VLM output and must stay).
+
+        Returns (features, attention_mask, image_mask, temb_add) -- temb_add is set only
+        under mem_cond_type == "adaln", where memory bypasses the KV entirely.
+        """
+        B = features.shape[0]
+        n_mem = mem_aug.shape[1]
+
+        if self.mem_cond_type == "adaln":
+            # Gate the pooled vector, not just the tokens: the pool has a learned bias,
+            # so pool(zeros) != 0.
+            mem_temb = self.mem_adaln_pool(mem_aug)
+            if mask_key_moment is not None:
+                mem_temb = mask_key_moment.view(B, 1).to(mem_temb.dtype) * mem_temb
+            if n_strip:
+                features = features[:, :-n_strip, :]
+                am = am[:, :-n_strip] if am is not None else None
+                im = im[:, :-n_strip] if im is not None else None
+            return features, am, im, mem_temb
+
+        # cross_attn: memory-augmented tokens take the moment-token slots (or are
+        # appended when there are none to take).
+        base = features[:, :-n_strip, :] if n_strip else features
+        features = torch.cat([base, mem_aug], dim=1)
+        if am is not None:
+            # Reuse the stripped slots' own mask so a padded row stays padded; when
+            # appending there is nothing to reuse and memory is simply visible.
+            mem_am = am[:, -n_strip:] if n_strip else am.new_ones(B, n_mem)
+            if mask_key_moment is not None:
+                # Masked rows must not attend to their (zeroed) memory tokens, else the
+                # zero-key tokens act as attention sinks.
+                mem_am = mem_am & (mask_key_moment > 0).view(B, 1)
+            am = torch.cat([am[:, :-n_strip] if n_strip else am, mem_am], dim=1)
+        if im is not None:
+            # Memory tokens are not image tokens for the alternate-VL DiT's split
+            # cross-attention; the stripped moment-token slots were already zeros there.
+            mem_im = im[:, -n_strip:] if n_strip else im.new_zeros(B, n_mem)
+            im = torch.cat([im[:, :-n_strip] if n_strip else im, mem_im], dim=1)
+        return features, am, im, None
+
+    # ------------------------------------------------------------ memory grounding
+    def _mem_grounding_on(self) -> bool:
+        """True when the mismatched-memory second pass should be built.
+
+        Training only: it is a loss term, and at inference there is no target to score
+        the mismatched pass against.
+        """
+        return (
+            self.training
+            and self.mem_ground_weight > 0
+            and self.use_hamlet
+            and self.memory_transformer is not None
+        )
+
+    def _shuffle_mem_seq(self, mem_seq: torch.Tensor, n_q: int):
+        """Build the mismatched memory window for the grounding loss.
+
+        Returns (shuffled, differs), or (None, None) when the configured shuffle cannot
+        change anything for this batch shape (B == 1 under batch_roll, K <= 2 under
+        block_perm) -- the caller then skips the second pass entirely.
+
+        `differs` is (B,) and marks the rows whose window actually changed. A roll can
+        hand a row back an identical window (two anchors of the same episode in one
+        batch), and a zoo pool still in warm-up is left-padded with the SAME block
+        repeated, so permuting it is a no-op. Those rows score identically in both
+        passes and would otherwise charge the hinge its full margin for a gap that is
+        structurally impossible.
+        """
+        B, L, d = mem_seq.shape
+        K = L // n_q
+        mode = self.mem_ground_shuffle
+        can_roll = mode in ("batch_roll", "both") and B > 1
+        can_perm = mode in ("block_perm", "both") and K > 2
+        if not (can_roll or can_perm):
+            # Nothing this shuffle can change: the grounding term would be a silent
+            # no-op for the whole run, so say so once rather than train past it.
+            if not getattr(self, "_mem_ground_warned", False):
+                self._mem_ground_warned = True
+                print(
+                    f"[HAMLET][WARN] mem_ground_shuffle={mode!r} cannot build a "
+                    f"mismatched window at B={B}, memory_window={K} "
+                    f"(batch_roll needs B>1, block_perm needs memory_window>2) -- the "
+                    f"grounding loss is inactive.",
+                    flush=True,
+                )
+            return None, None
+
+        blocks = mem_seq.view(B, K, n_q, d)
+        if can_perm:
+            # Same episode, wrong chronology. The trailing block is the CURRENT
+            # observation -- the memory transformer reads its output slice from that
+            # position and the splice treats it as "now" -- so only the past is
+            # permuted. Block-RoPE is what makes the reordering visible to the model.
+            perm = torch.rand(B, K - 1, device=mem_seq.device).argsort(dim=1)
+            idx = perm[:, :, None, None].expand(B, K - 1, n_q, d)
+            blocks = torch.cat([blocks[:, :-1].gather(1, idx), blocks[:, -1:]], dim=1)
+        if can_roll:
+            # Row i is conditioned on another row's window: a different episode
+            # altogether, which is the mismatch RA-VLA applies to its retrieved set.
+            blocks = blocks.roll(int(torch.randint(1, B, (1,)).item()), dims=0)
+
+        shuffled = blocks.reshape(B, L, d)
+        differs = (shuffled != mem_seq).flatten(1).any(dim=1)
+        return shuffled, differs
+
+    def _stash_grounding(
+        self,
+        backbone_output: BatchFeature,
+        bundle,  # (features, am, im, temb) from _condition_on_memory
+        differs: torch.Tensor,
+        mask_key_moment: torch.Tensor | None,
+    ) -> None:
+        """Park the mismatched-memory conditioning for the second DiT pass in forward()."""
+        features, am, im, temb = bundle
+        backbone_output["mem_r_features"] = features
+        if am is not None:
+            backbone_output["mem_r_attention_mask"] = am
+        if im is not None:
+            backbone_output["mem_r_image_mask"] = im
+        if temb is not None:
+            backbone_output["mem_r_temb_add"] = temb
+        if mask_key_moment is not None:
+            # A gated-off row has zero memory in BOTH passes -- same exclusion as a
+            # window that did not change.
+            differs = differs & (mask_key_moment > 0).view(-1)
+        backbone_output["mem_r_valid"] = differs
+
     def process_backbone_output_zoo(
         self,
         backbone_output: BatchFeature,
@@ -759,35 +934,32 @@ class Gr00tN1d6ActionHead(nn.Module):
                 f"mem_seq batch {mem_seq.shape[0]} != backbone batch {B}"
             )
 
-        mem_aug = self.memory_transformer(mem_seq)[:, -n_q:, :]  # (B, n_q, d)
-        if mask_key_moment is not None:
-            mem_aug = mask_key_moment.view(B, 1, 1).to(mem_aug.dtype) * mem_aug
+        am_in = backbone_output.get("backbone_attention_mask", None)
+        im_in = backbone_output.get("image_mask", None)
 
-        if self.mem_cond_type == "adaln":
-            # Gate the pooled vector, not just the tokens: the pool has a learned bias,
-            # so pool(zeros) != 0.
-            mem_temb = self.mem_adaln_pool(mem_aug)
-            if mask_key_moment is not None:
-                mem_temb = mask_key_moment.view(B, 1).to(mem_temb.dtype) * mem_temb
-            backbone_output["mem_temb_add"] = mem_temb
-            backbone_output["backbone_features"] = backbone_features[:, :-n_q, :]
-            if "backbone_attention_mask" in backbone_output:
-                backbone_output["backbone_attention_mask"] = backbone_output[
-                    "backbone_attention_mask"
-                ][:, :-n_q]
-            if "image_mask" in backbone_output:
-                backbone_output["image_mask"] = backbone_output["image_mask"][:, :-n_q]
-        else:
-            # cross_attn: memory-augmented tokens replace the moment-token tail.
-            backbone_output["backbone_features"] = torch.cat(
-                [backbone_features[:, :-n_q, :], mem_aug], dim=1
-            )
-            if mask_key_moment is not None and "backbone_attention_mask" in backbone_output:
-                # Masked rows must not attend to their (zeroed) memory tokens, else the
-                # zero-key tokens act as attention sinks.
-                am = backbone_output["backbone_attention_mask"]
-                backbone_output["backbone_attention_mask"] = torch.cat(
-                    [am[:, :-n_q], am[:, -n_q:] & (mask_key_moment > 0).view(B, 1)], dim=1
+        mem_aug = self._memory_tokens(mem_seq, n_q, mask_key_moment)  # (B, n_q, d)
+        feats, am, im, temb = self._condition_on_memory(
+            backbone_features, am_in, im_in, mem_aug, mask_key_moment, n_strip=n_q
+        )
+        backbone_output["backbone_features"] = feats
+        if am is not None:
+            backbone_output["backbone_attention_mask"] = am
+        if im is not None:
+            backbone_output["image_mask"] = im
+        if temb is not None:
+            backbone_output["mem_temb_add"] = temb
+
+        if self._mem_grounding_on():
+            mem_seq_r, differs = self._shuffle_mem_seq(mem_seq, n_q)
+            if mem_seq_r is not None:
+                mem_aug_r = self._memory_tokens(mem_seq_r, n_q, mask_key_moment)
+                self._stash_grounding(
+                    backbone_output,
+                    self._condition_on_memory(
+                        backbone_features, am_in, im_in, mem_aug_r, mask_key_moment, n_strip=n_q
+                    ),
+                    differs,
+                    mask_key_moment,
                 )
         return backbone_output
 
@@ -830,15 +1002,15 @@ class Gr00tN1d6ActionHead(nn.Module):
                     f"memory augmentation."
                 )
             if K == K_target:
-                # Extract index of mask_key_moment == 1 for each sample in the batch
                 mem_seq = primary.view(B, K, v_nq, d).view(B, K * v_nq, d)
                 key_moment_indices = None
+                sub_seq = mem_seq
                 if mask_key_moment is not None:
                     # Run the memory transformer on key-moment rows only, then scatter
                     # back; non-key rows keep zero memory.
                     key_moment_indices = (mask_key_moment == 1).view(-1)
-                    mem_seq = mem_seq[key_moment_indices]  # (B_key, K*v_nq, d)
-                mem_out = self.memory_transformer(mem_seq)
+                    sub_seq = mem_seq[key_moment_indices]  # (B_key, K*v_nq, d)
+                mem_out = self.memory_transformer(sub_seq)
                 mem_aug = mem_out[:, -v_nq:, :]
                 # Restore if mask_key_moment is not None, else mem_aug is already correct
                 if key_moment_indices is not None:
@@ -857,29 +1029,34 @@ class Gr00tN1d6ActionHead(nn.Module):
                     if "image_mask" in backbone_output
                     else None
                 )
-                if self.mem_cond_type == "adaln":
-                    # Gate the pooled vector, not just the tokens: the pool has a
-                    # learned bias, so pool(zeros) != 0.
-                    mem_temb = self.mem_adaln_pool(mem_aug)
-                    if mask_key_moment is not None:
-                        mem_temb = mask_key_moment.view(B, 1) * mem_temb
-                    backbone_output["mem_temb_add"] = mem_temb
-                else:
-                    current = torch.cat([current, mem_aug], dim=1)
-                    if am is not None:
-                        # Masked rows must not attend to their (zeroed) memory tokens,
-                        # else the zero-key tokens act as attention sinks.
-                        mem_am = am.new_ones(B, v_nq)
-                        if mask_key_moment is not None:
-                            mem_am = mem_am & (mask_key_moment > 0).view(B, 1)
-                        am = torch.cat([am, mem_am], dim=1)
-                    if im is not None:
-                        im = torch.cat([im, im.new_zeros(B, v_nq)], dim=1)
-                backbone_features = current
-                if am is not None:
-                    backbone_output["backbone_attention_mask"] = am
-                if im is not None:
-                    backbone_output["image_mask"] = im
+                # n_strip=0: the vision_feature path leaves the VLM tail alone and
+                # APPENDS the memory tokens (mem_aug is already gated above).
+                feats, am_out, im_out, temb = self._condition_on_memory(
+                    current, am, im, mem_aug, mask_key_moment, n_strip=0
+                )
+                if temb is not None:
+                    backbone_output["mem_temb_add"] = temb
+                backbone_features = feats
+                if am_out is not None:
+                    backbone_output["backbone_attention_mask"] = am_out
+                if im_out is not None:
+                    backbone_output["image_mask"] = im_out
+
+                if self._mem_grounding_on():
+                    mem_seq_r, differs = self._shuffle_mem_seq(mem_seq, v_nq)
+                    if mem_seq_r is not None:
+                        # No row-subsetting here: the gate is applied to the aggregated
+                        # tokens instead, which is output-equivalent and keeps the
+                        # shuffle operating on the full batch.
+                        mem_aug_r = self._memory_tokens(mem_seq_r, v_nq, mask_key_moment)
+                        self._stash_grounding(
+                            backbone_output,
+                            self._condition_on_memory(
+                                current, am, im, mem_aug_r, mask_key_moment, n_strip=0
+                            ),
+                            differs,
+                            mask_key_moment,
+                        )
             elif K == 1:
                 vis_current = primary  # (B, 64, d)
                 if self._vision_cache is None or self._vision_cache.shape[0] != B:
@@ -945,10 +1122,7 @@ class Gr00tN1d6ActionHead(nn.Module):
                 moment_all = backbone_features[:, -n_q:, :].contiguous().view(B, K, n_q, d)
                 # Extract moment token from backbone_features
                 mq_mem_seq = moment_all.view(B, K * n_q, d)  # oldest first -> current last
-                mq_memory_out = self.memory_transformer(mq_mem_seq)
-                mq_augmented = mq_memory_out[:, -n_q:, :]
-                if mask_key_moment is not None:
-                    mq_augmented = mask_key_moment.view(B, 1, 1) * mq_augmented
+                mq_augmented = self._memory_tokens(mq_mem_seq, n_q, mask_key_moment)
                 current = backbone_features.view(B, K, T, d)[:, -1, :, :]
                 am = (
                     backbone_output["backbone_attention_mask"].view(B, K, -1)[:, -1, :]
@@ -960,34 +1134,29 @@ class Gr00tN1d6ActionHead(nn.Module):
                     if "image_mask" in backbone_output
                     else None
                 )
-                if self.mem_cond_type == "adaln":
-                    # AdaLN-zero: pool memory -> temb add; slice moment-token tail off the KV.
-                    # Gate the pooled vector: the pool has a learned bias, so
-                    # pool(zeros) != 0.
-                    mem_temb = self.mem_adaln_pool(mq_augmented)
-                    if mask_key_moment is not None:
-                        mem_temb = mask_key_moment.view(B, 1) * mem_temb
-                    backbone_output["mem_temb_add"] = mem_temb
-                    current = current[:, :-n_q, :]
-                    if am is not None:
-                        am = am[:, :-n_q]
-                    if im is not None:
-                        im = im[:, :-n_q]
-                else:
-                    # cross_attn: memory-augmented tokens replace the moment-token tail.
-                    current = torch.cat([current[:, :-n_q, :], mq_augmented], dim=1)
-                    if am is not None and mask_key_moment is not None:
-                        # Masked rows must not attend to their (zeroed) memory tokens,
-                        # else the zero-key tokens act as attention sinks.
-                        am = torch.cat(
-                            [am[:, :-n_q], am[:, -n_q:] & (mask_key_moment > 0).view(B, 1)],
-                            dim=1,
+                feats, am_out, im_out, temb = self._condition_on_memory(
+                    current, am, im, mq_augmented, mask_key_moment, n_strip=n_q
+                )
+                if temb is not None:
+                    backbone_output["mem_temb_add"] = temb
+                backbone_features = feats
+                if am_out is not None:
+                    backbone_output["backbone_attention_mask"] = am_out
+                if im_out is not None:
+                    backbone_output["image_mask"] = im_out
+
+                if self._mem_grounding_on():
+                    mq_mem_seq_r, differs = self._shuffle_mem_seq(mq_mem_seq, n_q)
+                    if mq_mem_seq_r is not None:
+                        mq_augmented_r = self._memory_tokens(mq_mem_seq_r, n_q, mask_key_moment)
+                        self._stash_grounding(
+                            backbone_output,
+                            self._condition_on_memory(
+                                current, am, im, mq_augmented_r, mask_key_moment, n_strip=n_q
+                            ),
+                            differs,
+                            mask_key_moment,
                         )
-                backbone_features = current
-                if am is not None:
-                    backbone_output["backbone_attention_mask"] = am
-                if im is not None:
-                    backbone_output["image_mask"] = im
             elif K == 1:
                 # Inference path with rolling FIFO cache.
                 moment_current = backbone_features[:, -n_q:, :]  # (B, n_q, d)
@@ -1063,6 +1232,10 @@ class Gr00tN1d6ActionHead(nn.Module):
                 - loss: action prediction loss
         """
         # Set frozen modules to eval
+
+        logging.info(f"MAL: WEIGHT: {self.mem_ground_weight}")
+        logging.info(f"MAL: MARGIN: {self.mem_ground_margin}")
+
         self.set_frozen_modules_to_eval_mode()
 
         # K-step HAMLET: pass the action-input batch size so process_backbone_output can
@@ -1178,13 +1351,74 @@ class Gr00tN1d6ActionHead(nn.Module):
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = action_loss.sum() / (action_mask.sum() + 1e-6)
 
-        return {
+        outputs = {
             "loss": loss,
             "action_loss": action_loss,
             "action_mask": action_mask,
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
+
+        # Memory grounding (RA-VLA's mse_r / margin). Replay the DiT on the SAME noised
+        # trajectory and the SAME timestep, changing nothing but the memory tokens, and
+        # require the mismatched-memory pass to be at least `mem_ground_margin` worse.
+        # A policy that ignores memory produces identical velocities in both passes, so
+        # the gap is only obtainable by conditioning on what memory actually holds.
+        mem_r_embeds = backbone_output.get("mem_r_features", None)
+        if mem_r_embeds is not None:
+            mem_r_attn = backbone_output.get("mem_r_attention_mask", vl_attn_mask)
+            mem_r_temb = backbone_output.get("mem_r_temb_add", None)
+            if self.config.use_alternate_vl_dit:
+                model_output_r, _ = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=mem_r_embeds,
+                    encoder_attention_mask=mem_r_attn,
+                    timestep=t_discretized,
+                    return_all_hidden_states=True,
+                    image_mask=backbone_output.get(
+                        "mem_r_image_mask", backbone_output.image_mask
+                    ),
+                    backbone_attention_mask=mem_r_attn,
+                    temb_add=mem_r_temb,
+                )
+            else:
+                model_output_r, _ = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=mem_r_embeds,
+                    encoder_attention_mask=mem_r_attn,
+                    timestep=t_discretized,
+                    return_all_hidden_states=True,
+                    temb_add=mem_r_temb,
+                )
+            pred_r = self.action_decoder(model_output_r, embodiment_id)
+            action_loss_r = (
+                F.mse_loss(pred_r[:, -actions.shape[1] :], velocity, reduction="none")
+                * action_mask
+            )
+
+            # Per-sample MSE: the hinge compares two predictions for the SAME sample, so
+            # it has to be scored per row rather than over the batch sum.
+            denom = action_mask.flatten(1).sum(1).clamp(min=1)
+            mse_per_row = action_loss.flatten(1).sum(1) / denom
+            mse_r_per_row = action_loss_r.flatten(1).sum(1) / denom
+
+            # Rows whose memory did not actually change (see _shuffle_mem_seq) score the
+            # same in both passes; including them would charge the full margin for a gap
+            # that cannot exist and push mse up through the -mse term.
+            valid = backbone_output["mem_r_valid"].to(mse_per_row.dtype)
+            n_valid = valid.sum().clamp(min=1)
+            hinge = (self.mem_ground_margin - (mse_r_per_row - mse_per_row)).clamp(min=0)
+            ground_loss = (hinge * valid).sum() / n_valid
+            loss = loss + self.mem_ground_weight * ground_loss
+
+            outputs["mse_loss"] = outputs["loss"].detach()  # before the hinge was added
+            outputs["loss"] = loss
+            outputs["mem_ground_loss"] = ground_loss.detach()
+            # Logged so the gap can be watched directly: mse_r should pull away from mse.
+            outputs["mse_r"] = ((mse_r_per_row * valid).sum() / n_valid).detach()
+            outputs["mem_ground_rows"] = valid.sum().detach()
+
+        return outputs
 
     def _encode_features(
         self,

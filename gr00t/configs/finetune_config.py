@@ -295,6 +295,40 @@ class FinetuneConfig:
     "vision_feature": primary view (first modality_key) image tokens, post-LLM, avg-pooled
     to 64/step (no moment tokens added). Supports both mem_cond_type values."""
 
+    mem_ground_weight: float = 0.0
+    """Weight of the memory-grounding hinge (RA-VLA's mse_r / margin term).
+
+    Every training step the action head replays the DiT on the SAME noised trajectory
+    with a MISMATCHED memory window and requires that pass to be at least
+    `mem_ground_margin` worse in per-sample flow MSE:
+
+        loss = mse + mem_ground_weight * relu(mem_ground_margin - (mse_r - mse))
+
+    A policy that ignores memory predicts identically in both passes and pays the full
+    margin, so the only way to reduce the term is to actually condition on what memory
+    holds. 0 disables the second pass entirely (no extra compute); when on, expect
+    roughly one extra DiT + memory-transformer forward/backward per step (the backbone
+    is NOT re-run). Training-only."""
+
+    mem_ground_margin: float = 0.0
+    """How much worse the mismatched-memory pass must be before the hinge is satisfied.
+
+    In the same units as the flow-matching MSE, so scale it against the observed
+    `mse_loss`: a margin far above it saturates the hinge and the gradient just fights
+    the main objective. Start around 5-20% of the running mse."""
+
+    mem_ground_shuffle: Literal["batch_roll", "block_perm", "both"] = "batch_roll"
+    """How the mismatched memory window is built.
+
+    "batch_roll": each row is handed another batch row's window -- a different episode
+        entirely. This is the mismatch RA-VLA applies to its retrieved neighbours, and
+        it grounds the policy in memory CONTENT. Needs per_device_batch_size > 1.
+    "block_perm": the row keeps its own blocks but in a random chronological order,
+        with the current observation left in place. Grounds TEMPORAL structure: it only
+        bites if the model reads the order of the past, not just its contents. Needs
+        memory_window > 2.
+    "both": permute the chronology and then swap rows."""
+
     use_key_moment_gate: bool = True
     """Key-moment gate. When True, memory is zeroed out on non-key-moment steps
     (window-end joint-state delta >= delta_threshold) in both training and inference;
