@@ -109,6 +109,9 @@ class Gr00tN1d6Pipeline(ModelPipeline):
                 mem_ground_weight=self.config.model.mem_ground_weight,
                 mem_ground_margin=self.config.model.mem_ground_margin,
                 mem_ground_shuffle=self.config.model.mem_ground_shuffle,
+                mem_ground_gap_max=self.config.model.mem_ground_gap_max,
+                mem_ground_warmup_steps=self.config.model.mem_ground_warmup_steps,
+                mem_ground_ramp_steps=self.config.model.mem_ground_ramp_steps,
             )
 
             # Initialize mask_tokens if they are not present in the base checkpoint

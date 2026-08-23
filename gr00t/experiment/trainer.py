@@ -195,7 +195,7 @@ class Gr00tTrainer(Trainer):
         # every micro-batch since the last log so no per-step host sync is added, then
         # averaged and merged into the `loss` log line.
         self._aux_sums: dict[str, torch.Tensor] = {}
-        self._aux_count = 0
+        self._aux_weights: dict[str, torch.Tensor] = {}
         super().__init__(
             *args,
             **kwargs,
@@ -203,7 +203,14 @@ class Gr00tTrainer(Trainer):
         )
 
     # Reported next to `loss` when the model emits them; see Gr00tN1d6ActionHead.forward.
-    AUX_LOG_KEYS = ("mse_loss", "mem_ground_loss", "mse_r")
+    AUX_LOG_KEYS = ("mse_loss", "mem_ground_loss", "mse_r", "mem_gap")
+    # Of those, the ones measured over valid rows only, so their running average is
+    # weighted by how many rows each step actually had. A step with no valid rows
+    # reports 0 for all of them, and averaging that in would drag the curve toward zero
+    # for reasons that have nothing to do with training. `mse_loss` is a whole-batch
+    # number and is averaged unweighted.
+    AUX_ROW_WEIGHTED_KEYS = ("mem_ground_loss", "mse_r", "mem_gap")
+    AUX_WEIGHT_KEY = "mem_ground_n"
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         # Merge the accumulated auxiliary scalars into the training-loss line (rather
@@ -211,11 +218,13 @@ class Gr00tTrainer(Trainer):
         # These are this rank's own micro-batches, NOT all-reduced like `loss`: the
         # keys present can differ per rank (a rank whose last batch is B==1 builds no
         # mismatched-memory pass), and a collective here would then hang.
-        if "loss" in logs and self._aux_count:
+        if "loss" in logs and self._aux_sums:
             for key, total in self._aux_sums.items():
-                logs[key] = round(float(total) / self._aux_count, 6)
+                denom = self._aux_weights.get(key, 0.0)
+                if denom:
+                    logs[key] = round(float(total) / float(denom), 6)
             self._aux_sums = {}
-            self._aux_count = 0
+            self._aux_weights = {}
 
         # Hide epoch from logged metrics as it's misleading for Iterable datasets.
         epoch = self.state.epoch
@@ -326,16 +335,15 @@ class Gr00tTrainer(Trainer):
         # device tensors and summed here so the accumulation costs no host sync; the
         # single .item() happens in `log`.
         if model.training and hasattr(outputs, "get"):
-            found = False
+            rows = outputs.get(self.AUX_WEIGHT_KEY)
+            rows = 1.0 if rows is None else rows.detach()
             for key in self.AUX_LOG_KEYS:
                 value = outputs.get(key)
                 if value is None:
                     continue
-                value = value.detach()
-                self._aux_sums[key] = self._aux_sums.get(key, 0) + value
-                found = True
-            if found:
-                self._aux_count += 1
+                weight = rows if key in self.AUX_ROW_WEIGHTED_KEYS else 1.0
+                self._aux_sums[key] = self._aux_sums.get(key, 0) + value.detach() * weight
+                self._aux_weights[key] = self._aux_weights.get(key, 0) + weight
 
         # --------------------------------------------------------------
         # Accuracy calculation

@@ -297,10 +297,31 @@ class Gr00tN1d6ActionHead(nn.Module):
                 f"mem_ground_shuffle must be one of batch_roll/block_perm/both, "
                 f"got {self.mem_ground_shuffle!r}"
             )
+        self.mem_ground_gap_max = float(getattr(config, "mem_ground_gap_max", 0.0))
+        self.mem_ground_warmup_steps = int(getattr(config, "mem_ground_warmup_steps", 0))
+        self.mem_ground_ramp_steps = int(getattr(config, "mem_ground_ramp_steps", 0))
+        if self.mem_ground_gap_max > 0 and self.mem_ground_gap_max <= self.mem_ground_margin:
+            raise ValueError(
+                f"mem_ground_gap_max={self.mem_ground_gap_max} must exceed "
+                f"mem_ground_margin={self.mem_ground_margin}; otherwise the two edges of "
+                f"the band overlap and every row is penalized whatever the gap is."
+            )
+        # Training-step counter driving the warmup schedule. Persistent so a resumed run
+        # picks the schedule back up instead of restarting it; absent from older
+        # checkpoints, where it loads as 0.
+        self.register_buffer(
+            "_mem_ground_step", torch.zeros((), dtype=torch.long), persistent=True
+        )
+        # Host-side mirror of that buffer. Reading the buffer itself would sync the
+        # device every step just to evaluate the schedule; this is seeded from it once
+        # (so a resumed run inherits the right step) and then tracked in lockstep.
+        self._mem_ground_step_host: int | None = None
         if self.mem_ground_weight > 0:
             print(
                 f"Memory grounding: weight={self.mem_ground_weight} "
-                f"margin={self.mem_ground_margin} shuffle={self.mem_ground_shuffle}"
+                f"margin={self.mem_ground_margin} gap_max={self.mem_ground_gap_max} "
+                f"shuffle={self.mem_ground_shuffle} "
+                f"warmup={self.mem_ground_warmup_steps} ramp={self.mem_ground_ramp_steps}"
             )
 
         self.set_trainable_parameters(
@@ -827,17 +848,35 @@ class Gr00tN1d6ActionHead(nn.Module):
         return features, am, im, None
 
     # ------------------------------------------------------------ memory grounding
+    def _mem_ground_scale(self) -> float:
+        """Warmup multiplier on `mem_ground_weight` for the current step, in [0, 1].
+
+        Zero for the first `mem_ground_warmup_steps`, then a linear ramp over
+        `mem_ground_ramp_steps`. Held off early because before the flow-matching phase
+        transition both passes just predict the mean velocity: the gap is noise, and
+        pushing on it only destabilizes the memory representation.
+        """
+        step = self._mem_ground_step_host or 0
+        if step < self.mem_ground_warmup_steps:
+            return 0.0
+        if self.mem_ground_ramp_steps <= 0:
+            return 1.0
+        progress = (step - self.mem_ground_warmup_steps) / self.mem_ground_ramp_steps
+        return min(1.0, progress)
+
     def _mem_grounding_on(self) -> bool:
         """True when the mismatched-memory second pass should be built.
 
         Training only: it is a loss term, and at inference there is no target to score
-        the mismatched pass against.
+        the mismatched pass against. A zero warmup scale also skips it, so the warmup
+        period costs no extra forward/backward.
         """
         return (
             self.training
             and self.mem_ground_weight > 0
             and self.use_hamlet
             and self.memory_transformer is not None
+            and self._mem_ground_scale() > 0
         )
 
     def _shuffle_mem_seq(self, mem_seq: torch.Tensor, n_q: int):
@@ -1238,6 +1277,15 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         self.set_frozen_modules_to_eval_mode()
 
+        # Drives the grounding warmup. Advanced before the memory paths run, because they
+        # consult the schedule to decide whether to build the mismatched pass at all.
+        if self.training and self.mem_ground_weight > 0:
+            if self._mem_ground_step_host is None:
+                # One device read per process, picking up a resumed checkpoint's step.
+                self._mem_ground_step_host = int(self._mem_ground_step)
+            self._mem_ground_step_host += 1
+            self._mem_ground_step += 1
+
         # K-step HAMLET: pass the action-input batch size so process_backbone_output can
         # collapse the B*K backbone rows back to B current-step rows after memory aggregation.
         B_target = action_input.state.shape[0]
@@ -1407,15 +1455,36 @@ class Gr00tN1d6ActionHead(nn.Module):
             # that cannot exist and push mse up through the -mse term.
             valid = backbone_output["mem_r_valid"].to(mse_per_row.dtype)
             n_valid = valid.sum().clamp(min=1)
-            hinge = (self.mem_ground_margin - (mse_r_per_row - mse_per_row)).clamp(min=0)
-            ground_loss = (hinge * valid).sum() / n_valid
-            loss = loss + self.mem_ground_weight * ground_loss
 
-            outputs["mse_loss"] = outputs["loss"].detach()  # before the hinge was added
+            # Two-sided band on the gap. The lower edge is RA-VLA's hinge: too little
+            # memory dependence. The upper edge is the one that keeps training alive --
+            # an unbounded gap means wrong memory is catastrophic, which destabilizes
+            # training and ends with the policy retreating to ignoring memory entirely.
+            # That retreat is an ABSORBING state: at exact invariance both passes are the
+            # same function of the parameters, so the gap gradient vanishes and no amount
+            # of further training escapes it. Cheaper to never get there.
+            gap = mse_r_per_row - mse_per_row
+            band = (self.mem_ground_margin - gap).clamp(min=0)
+            if self.mem_ground_gap_max > 0:
+                band = band + (gap - self.mem_ground_gap_max).clamp(min=0)
+            ground_loss = (band * valid).sum() / n_valid
+            scale = self._mem_ground_scale()
+            loss = loss + scale * self.mem_ground_weight * ground_loss
+
+            outputs["mse_loss"] = outputs["loss"].detach()  # before the band was added
             outputs["loss"] = loss
             outputs["mem_ground_loss"] = ground_loss.detach()
-            # Logged so the gap can be watched directly: mse_r should pull away from mse.
             outputs["mse_r"] = ((mse_r_per_row * valid).sum() / n_valid).detach()
+            # The quantity the band is defined on, differenced PER ROW so both terms come
+            # from the same sample, timestep and noise draw. That pairing cancels the
+            # sample-difficulty and noise variance that dominate `mse_r - mse_loss`, which
+            # is why the gap reads clearly here long before it is visible in those two.
+            outputs["mem_gap"] = ((gap * valid).sum() / n_valid).detach()
+            # Not logged: used by the trainer purely to weight the running averages, so a
+            # step with no valid rows contributes nothing instead of folding in a zero.
+            # Deliberately the UNCLAMPED count -- `n_valid` floors at 1 to keep the
+            # division finite, which would give an empty step full weight.
+            outputs["mem_ground_n"] = valid.sum().detach()
 
         return outputs
 

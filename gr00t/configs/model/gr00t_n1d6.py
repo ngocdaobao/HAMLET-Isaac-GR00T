@@ -161,6 +161,22 @@ class Gr00tN1d6Config(PretrainedConfig):
     #       than content. Needs memory_window > 2.
     #   "both": permute chronology and swap rows.
     mem_ground_shuffle: str = "batch_roll"
+    # Upper edge of the gap band. The one-sided hinge only punishes too LITTLE memory
+    # dependence, which lets the gap run away: the policy becomes hypersensitive, wrong
+    # memory turns catastrophic, and training destabilizes until it retreats to ignoring
+    # memory entirely (an absorbing state -- at exact invariance both passes are the same
+    # function of theta, so the hinge gradient is zero and cannot escape). Penalizing
+    # gap > mem_ground_gap_max keeps the dependence in a band instead. <= 0 disables the
+    # upper edge, restoring the plain one-sided hinge.
+    mem_ground_gap_max: float = 0.1
+    # Steps of ZERO grounding weight at the start of training. Before the flow-matching
+    # phase transition both passes predict the mean velocity and the gap is pure noise,
+    # so the hinge only thrashes the memory representation. The second DiT pass is
+    # skipped entirely while the weight is 0, so warmup costs nothing.
+    mem_ground_warmup_steps: int = 2000
+    # Steps to ramp the weight linearly from 0 to mem_ground_weight once warmup ends.
+    # 0 = switch on at full weight.
+    mem_ground_ramp_steps: int = 2000
     # Key-moment gate: when True, memory is zeroed out on non-key-moment steps
     # (window-end joint-state delta >= delta_threshold). When False, memory is
     # never gated -> plain HAMLET. Persisted to the checkpoint config so eval

@@ -123,7 +123,23 @@ if __name__ == "__main__":
     config.model.mem_ground_weight = ft_config.mem_ground_weight
     config.model.mem_ground_margin = ft_config.mem_ground_margin
     config.model.mem_ground_shuffle = ft_config.mem_ground_shuffle
+    config.model.mem_ground_gap_max = ft_config.mem_ground_gap_max
+    config.model.mem_ground_warmup_steps = ft_config.mem_ground_warmup_steps
+    config.model.mem_ground_ramp_steps = ft_config.mem_ground_ramp_steps
     if ft_config.mem_ground_weight > 0:
+        if 0 < ft_config.mem_ground_gap_max <= ft_config.mem_ground_margin:
+            raise ValueError(
+                f"mem_ground_gap_max={ft_config.mem_ground_gap_max} must exceed "
+                f"mem_ground_margin={ft_config.mem_ground_margin}; otherwise the two "
+                f"edges of the band overlap and every row is penalized whatever its "
+                f"gap is."
+            )
+        if ft_config.mem_ground_warmup_steps >= ft_config.max_steps:
+            raise ValueError(
+                f"mem_ground_warmup_steps={ft_config.mem_ground_warmup_steps} >= "
+                f"max_steps={ft_config.max_steps}: the grounding term would never "
+                f"switch on."
+            )
         if ft_config.hamlet_mode != "finetune":
             raise ValueError(
                 f"mem_ground_weight={ft_config.mem_ground_weight} needs hamlet_mode="
@@ -143,8 +159,10 @@ if __name__ == "__main__":
             )
         print(
             f"[HAMLET] memory grounding: weight={ft_config.mem_ground_weight} "
-            f"margin={ft_config.mem_ground_margin} "
-            f"shuffle={ft_config.mem_ground_shuffle}"
+            f"band=[{ft_config.mem_ground_margin}, {ft_config.mem_ground_gap_max}] "
+            f"shuffle={ft_config.mem_ground_shuffle} "
+            f"warmup={ft_config.mem_ground_warmup_steps} "
+            f"ramp={ft_config.mem_ground_ramp_steps}"
         )
     if (
         ft_config.hamlet_mode == "finetune"

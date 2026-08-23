@@ -302,20 +302,52 @@ class FinetuneConfig:
     with a MISMATCHED memory window and requires that pass to be at least
     `mem_ground_margin` worse in per-sample flow MSE:
 
-        loss = mse + mem_ground_weight * relu(mem_ground_margin - (mse_r - mse))
+        gap  = mse_r - mse                      (per row)
+        loss = mse + mem_ground_weight * [ relu(mem_ground_margin - gap)
+                                         + relu(gap - mem_ground_gap_max) ]
 
     A policy that ignores memory predicts identically in both passes and pays the full
     margin, so the only way to reduce the term is to actually condition on what memory
     holds. 0 disables the second pass entirely (no extra compute); when on, expect
     roughly one extra DiT + memory-transformer forward/backward per step (the backbone
-    is NOT re-run). Training-only."""
+    is NOT re-run). Training-only.
+
+    Scaled by the `mem_ground_warmup_steps` / `mem_ground_ramp_steps` schedule. 0.1 has
+    trained stably here; 0.2 collapsed (see `mem_ground_gap_max`)."""
 
     mem_ground_margin: float = 0.0
-    """How much worse the mismatched-memory pass must be before the hinge is satisfied.
+    """How much worse the mismatched-memory pass must be before the lower edge is met.
 
     In the same units as the flow-matching MSE, so scale it against the observed
     `mse_loss`: a margin far above it saturates the hinge and the gradient just fights
     the main objective. Start around 5-20% of the running mse."""
+
+    mem_ground_gap_max: float = 0.1
+    """Upper edge of the gap band; <= 0 restores the plain one-sided hinge.
+
+    The one-sided hinge only punishes too LITTLE memory dependence, so nothing stops the
+    gap running away. Observed at mem_ground_weight=0.2: the gap climbed to 0.3-0.9
+    (wrong memory catastrophic), training thrashed for ~9k steps, then the policy
+    retreated to ignoring memory entirely and the gap sat at 0 for the rest of the run.
+    That retreat is an ABSORBING state -- at exact invariance both passes are the same
+    function of the parameters, so the gap gradient is zero and no amount of further
+    training escapes it. It has to be prevented, not recovered from.
+
+    Set it a few times `mem_ground_margin` and above the gap a healthy run actually
+    reaches (~0.06 at margin 0.01), so it only engages on a runaway. Must exceed
+    `mem_ground_margin`, else the two edges overlap and every row is penalized."""
+
+    mem_ground_warmup_steps: int = 2000
+    """Steps of ZERO grounding weight at the start of training.
+
+    Before the flow-matching phase transition (~step 500-1000 here) both passes just
+    predict the mean velocity, the gap is noise, and pushing on it only thrashes the
+    memory representation. The second DiT pass is skipped while the weight is 0, so
+    warmup costs nothing. Set past the step where `mse_loss` visibly drops."""
+
+    mem_ground_ramp_steps: int = 2000
+    """Steps to ramp the weight linearly from 0 to `mem_ground_weight` after warmup.
+    0 = switch on at full weight."""
 
     mem_ground_shuffle: Literal["batch_roll", "block_perm", "both"] = "block_perm"
     """How the mismatched memory window is built.

@@ -102,12 +102,15 @@ SHARD_SIZE="${SHARD_SIZE:-1024}"
 # workers a shard's batches land every Nth iteration, but _order_for_batch_slots still
 # advances each episode by one anchor per appearance, so that episode's observations
 # still arrive in temporal order ANCHOR_STRIDE apart -- which is all the pool needs.
-DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-5}"
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
 
 # memory adherence loss 
-MEM_GROUND_WEIGHT="${MEM_GROUND_WEIGHT:-0.1}"  # weight on the hinge loss that penalizes memory drift
-MEM_GROUND_MARGIN="${MEM_GROUND_MARGIN:-0.01}"  # margin for the
-MEM_GROUP_SHUFFLE="${MEM_GROUP_SHUFFLE:-block_perm}"  
+MEM_GROUND_WEIGHT="${MEM_GROUND_WEIGHT:-0.1}"   # weight on the band loss. 0.1 trains stably; 0.2 collapsed the memory pathway at ~11k.
+MEM_GROUND_MARGIN="${MEM_GROUND_MARGIN:-0.01}"  # lower edge: mse_r must beat mse by this much
+MEM_GROUND_GAP_MAX="${MEM_GROUND_GAP_MAX:-0.1}" # upper edge: penalize runaway dependence (a healthy run sits near 0.06). <=0 = one-sided hinge.
+MEM_GROUND_WARMUP_STEPS="${MEM_GROUND_WARMUP_STEPS:-2000}"  # steps at zero weight; set past the mse_loss phase transition (~500-1000)
+MEM_GROUND_RAMP_STEPS="${MEM_GROUND_RAMP_STEPS:-2000}"      # linear ramp to full weight after warmup; 0 = hard switch
+MEM_GROUND_SHUFFLE="${MEM_GROUND_SHUFFLE:-block_perm}"      # batch_roll | block_perm | both
 
 
 # Memory pool selection hyperparameters (see gr00t_n1d6.py _pool_density)
@@ -163,6 +166,7 @@ fi
 echo "[cfg] host=$(hostname) commit=$(git rev-parse --short HEAD 2>/dev/null || echo n/a) dataset=$DATASET_PATH base_model=$BASE_MODEL"
 echo "[cfg] gpus=$NUM_GPUS batch=$GLOBAL_BATCH_SIZE grad_accum=$GRAD_ACCUM max_steps=$MAX_STEPS save_steps=$SAVE_STEPS"
 echo "[cfg] memory_mode=$MEMORY_MODE K=$K stride=$MEMORY_STRIDE n_moment=$N_MOMENT_TOKENS cond=$MEM_COND_TYPE type=$MEMORY_TYPE gate=$USE_KEY_MOMENT_GATE delta=$DELTA_THRESHOLD"
+echo "[cfg] mem_ground weight=$MEM_GROUND_WEIGHT band=[$MEM_GROUND_MARGIN,$MEM_GROUND_GAP_MAX] shuffle=$MEM_GROUND_SHUFFLE warmup=$MEM_GROUND_WARMUP_STEPS ramp=$MEM_GROUND_RAMP_STEPS"
 echo "[cfg] zoo density_w=$ZOO_DENSITY_WEIGHT step_tau=$ZOO_STEP_TAU dist_tau=$ZOO_DIST_TAU density_k=$ZOO_DENSITY_K density_temp=$ZOO_DENSITY_TEMP max_episodes=$ZOO_MAX_EPISODES recent_slots=$ZOO_RECENT_SLOTS selected_slots=$((K - ZOO_RECENT_SLOTS))"
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3
@@ -192,4 +196,8 @@ torchrun --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_PORT" \
     --zoo-recent-slots "$ZOO_RECENT_SLOTS" \
     --mem-ground-weight "$MEM_GROUND_WEIGHT" \
     --mem-ground-margin "$MEM_GROUND_MARGIN" \
+    --mem-ground-gap-max "$MEM_GROUND_GAP_MAX" \
+    --mem-ground-warmup-steps "$MEM_GROUND_WARMUP_STEPS" \
+    --mem-ground-ramp-steps "$MEM_GROUND_RAMP_STEPS" \
+    --mem-ground-shuffle "$MEM_GROUND_SHUFFLE" \
     "${MOMENT_ARGS[@]}"
