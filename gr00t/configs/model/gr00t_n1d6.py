@@ -160,6 +160,11 @@ class Gr00tN1d6Config(PretrainedConfig):
     #       the current observation left in place. Grounds temporal structure rather
     #       than content. Needs memory_window > 2.
     #   "both": permute chronology and swap rows.
+    #   "recent_only": ABLATION rather than corruption -- keep only the trailing
+    #       zoo_recent_slots blocks (recent + current) and drop every selector-filled
+    #       pool block, left-padding as the warm-up path does. The gap is then the value
+    #       of the long-term pool over plain recency. Needs memory_window >
+    #       zoo_recent_slots.
     mem_ground_shuffle: str = "batch_roll"
     # Upper edge of the gap band. The one-sided hinge only punishes too LITTLE memory
     # dependence, which lets the gap run away: the policy becomes hypersensitive, wrong

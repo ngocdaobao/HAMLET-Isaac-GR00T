@@ -292,10 +292,12 @@ class Gr00tN1d6ActionHead(nn.Module):
         self.mem_ground_weight = float(getattr(config, "mem_ground_weight", 0.0))
         self.mem_ground_margin = float(getattr(config, "mem_ground_margin", 0.0))
         self.mem_ground_shuffle = getattr(config, "mem_ground_shuffle", "batch_roll")
-        if self.mem_ground_shuffle not in ("batch_roll", "block_perm", "both"):
+        if self.mem_ground_shuffle not in (
+            "batch_roll", "block_perm", "both", "recent_only"
+        ):
             raise ValueError(
-                f"mem_ground_shuffle must be one of batch_roll/block_perm/both, "
-                f"got {self.mem_ground_shuffle!r}"
+                f"mem_ground_shuffle must be one of batch_roll/block_perm/both/"
+                f"recent_only, got {self.mem_ground_shuffle!r}"
             )
         self.mem_ground_gap_max = float(getattr(config, "mem_ground_gap_max", 0.0))
         self.mem_ground_warmup_steps = int(getattr(config, "mem_ground_warmup_steps", 0))
@@ -882,37 +884,59 @@ class Gr00tN1d6ActionHead(nn.Module):
     def _shuffle_mem_seq(self, mem_seq: torch.Tensor, n_q: int):
         """Build the mismatched memory window for the grounding loss.
 
-        Returns (shuffled, differs), or (None, None) when the configured shuffle cannot
+        Returns (shuffled, differs), or (None, None) when the configured mismatch cannot
         change anything for this batch shape (B == 1 under batch_roll, K <= 2 under
-        block_perm) -- the caller then skips the second pass entirely.
+        block_perm, K <= zoo_recent_slots under recent_only) -- the caller then skips
+        the second pass entirely.
 
         `differs` is (B,) and marks the rows whose window actually changed. A roll can
         hand a row back an identical window (two anchors of the same episode in one
         batch), and a zoo pool still in warm-up is left-padded with the SAME block
-        repeated, so permuting it is a no-op. Those rows score identically in both
-        passes and would otherwise charge the hinge its full margin for a gap that is
-        structurally impossible.
+        repeated, so both permuting it and dropping it are no-ops. Those rows score
+        identically in both passes and would otherwise charge the hinge its full margin
+        for a gap that is structurally impossible.
         """
         B, L, d = mem_seq.shape
         K = L // n_q
         mode = self.mem_ground_shuffle
+        # Trailing blocks reserved for the newest observations: recent(m-1) + [current].
+        # Same clamp process_mem_cache applies when it assembles the window.
+        m = max(1, min(int(getattr(self.config, "zoo_recent_slots", 2)), K))
         can_roll = mode in ("batch_roll", "both") and B > 1
         can_perm = mode in ("block_perm", "both") and K > 2
-        if not (can_roll or can_perm):
-            # Nothing this shuffle can change: the grounding term would be a silent
+        can_recent = mode == "recent_only" and K > m
+        if not (can_roll or can_perm or can_recent):
+            # Nothing this mismatch can change: the grounding term would be a silent
             # no-op for the whole run, so say so once rather than train past it.
             if not getattr(self, "_mem_ground_warned", False):
                 self._mem_ground_warned = True
                 print(
                     f"[HAMLET][WARN] mem_ground_shuffle={mode!r} cannot build a "
-                    f"mismatched window at B={B}, memory_window={K} "
-                    f"(batch_roll needs B>1, block_perm needs memory_window>2) -- the "
-                    f"grounding loss is inactive.",
+                    f"mismatched window at B={B}, memory_window={K}, "
+                    f"zoo_recent_slots={m} (batch_roll needs B>1, block_perm needs "
+                    f"memory_window>2, recent_only needs memory_window>zoo_recent_slots)"
+                    f" -- the grounding loss is inactive.",
                     flush=True,
                 )
             return None, None
 
         blocks = mem_seq.view(B, K, n_q, d)
+        if can_recent:
+            # Ablation rather than corruption: keep only the m reserved trailing blocks
+            # -- recent(m-1) + [current] -- and drop every selector-filled pool block.
+            # The gap is then literally the value of the long-term pool over plain
+            # short-horizon recency, which is the question the zoo memory exists to
+            # answer; the shuffle modes only ask whether memory is read at all.
+            #
+            # The dropped slots are left-padded by repeating the oldest kept block,
+            # exactly as process_mem_cache pads a pool that has not filled yet. That
+            # keeps the sequence at K blocks (MemoryTransformer's block-RoPE and mask
+            # are built for a fixed T) AND keeps it in-distribution: this is a state
+            # the model genuinely sees during every episode's warm-up, so the gap
+            # measures the missing pool rather than a novel input pattern.
+            keep = blocks[:, -m:]
+            pad = keep[:, :1].expand(B, K - m, n_q, d)
+            blocks = torch.cat([pad, keep], dim=1)
         if can_perm:
             # Same episode, wrong chronology. The trailing block is the CURRENT
             # observation -- the memory transformer reads its output slice from that

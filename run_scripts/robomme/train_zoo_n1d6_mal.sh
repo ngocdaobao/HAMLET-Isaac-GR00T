@@ -110,7 +110,9 @@ MEM_GROUND_MARGIN="${MEM_GROUND_MARGIN:-0.01}"  # lower edge: mse_r must beat ms
 MEM_GROUND_GAP_MAX="${MEM_GROUND_GAP_MAX:-0.1}" # upper edge: penalize runaway dependence (a healthy run sits near 0.06). <=0 = one-sided hinge.
 MEM_GROUND_WARMUP_STEPS="${MEM_GROUND_WARMUP_STEPS:-2000}"  # steps at zero weight; set past the mse_loss phase transition (~500-1000)
 MEM_GROUND_RAMP_STEPS="${MEM_GROUND_RAMP_STEPS:-2000}"      # linear ramp to full weight after warmup; 0 = hard switch
-MEM_GROUND_SHUFFLE="${MEM_GROUND_SHUFFLE:-block_perm}"      # batch_roll | block_perm | both
+MEM_GROUND_SHUFFLE="${MEM_GROUND_SHUFFLE:-recent_only}"      # batch_roll | block_perm | both | recent_only
+# recent_only: mse_r is the prediction with NO pool -- only the last $ZOO_RECENT_SLOTS blocks (recent + current).
+#              mem_gap then reads directly as what the long-term pool is worth over plain recency.
 
 
 # Memory pool selection hyperparameters (see gr00t_n1d6.py _pool_density)

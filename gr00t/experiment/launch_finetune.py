@@ -157,6 +157,16 @@ if __name__ == "__main__":
                 f"{ft_config.memory_window}; only the current block would be left). "
                 f"Use 'batch_roll' instead."
             )
+        if (
+            ft_config.mem_ground_shuffle == "recent_only"
+            and ft_config.memory_window <= ft_config.zoo_recent_slots
+        ):
+            raise ValueError(
+                f"mem_ground_shuffle='recent_only' drops the selector-filled pool "
+                f"blocks, so it needs memory_window > zoo_recent_slots (got "
+                f"{ft_config.memory_window} <= {ft_config.zoo_recent_slots}; the window "
+                f"is all reserved slots, leaving no pool to ablate)."
+            )
         print(
             f"[HAMLET] memory grounding: weight={ft_config.mem_ground_weight} "
             f"band=[{ft_config.mem_ground_margin}, {ft_config.mem_ground_gap_max}] "

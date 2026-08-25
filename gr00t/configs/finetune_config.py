@@ -349,8 +349,12 @@ class FinetuneConfig:
     """Steps to ramp the weight linearly from 0 to `mem_ground_weight` after warmup.
     0 = switch on at full weight."""
 
-    mem_ground_shuffle: Literal["batch_roll", "block_perm", "both"] = "block_perm"
+    mem_ground_shuffle: Literal[
+        "batch_roll", "block_perm", "both", "recent_only"
+    ] = "block_perm"
     """How the mismatched memory window is built.
+
+    The first three CORRUPT memory and ask whether it is read at all:
 
     "batch_roll": each row is handed another batch row's window -- a different episode
         entirely. This is the mismatch RA-VLA applies to its retrieved neighbours, and
@@ -359,7 +363,19 @@ class FinetuneConfig:
         with the current observation left in place. Grounds TEMPORAL structure: it only
         bites if the model reads the order of the past, not just its contents. Needs
         memory_window > 2.
-    "both": permute the chronology and then swap rows."""
+    "both": permute the chronology and then swap rows.
+
+    The last ABLATES memory and asks what the long-term pool is worth:
+
+    "recent_only": keep only the trailing `zoo_recent_slots` blocks -- recent(m-1) plus
+        the current observation -- and drop every selector-filled pool block, left-
+        padding the dropped slots by repeating the oldest kept block exactly as the
+        pool's own warm-up path does. mse_r is then the model's prediction with plain
+        short-horizon recency and no retrieved history, so `mem_gap` reads directly as
+        the value the zoo pool adds over recency. Because the padded window is a state
+        the model already sees during every episode's warm-up, the gap measures the
+        missing pool rather than a novel input pattern. Needs memory_window >
+        zoo_recent_slots."""
 
     use_key_moment_gate: bool = True
     """Key-moment gate. When True, memory is zeroed out on non-key-moment steps
