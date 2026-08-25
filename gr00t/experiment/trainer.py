@@ -314,6 +314,16 @@ class Gr00tTrainer(Trainer):
         *and* model outputs, we calculate accuracy and push it to the logger.
         """
 
+        # Drive the memory-grounding warmup off the true optimizer step. Set before the
+        # forward, since the action head consults the schedule to decide whether to
+        # build the mismatched-memory pass at all.
+        inner = model
+        while not hasattr(inner, "action_head") and hasattr(inner, "module"):
+            inner = inner.module  # unwrap DDP / compile / accelerate layers
+        set_step = getattr(getattr(inner, "action_head", None), "set_mem_ground_step", None)
+        if set_step is not None:
+            set_step(self.state.global_step)
+
         # Use parent implementation to preserve built-in functionality.
         loss, outputs = super().compute_loss(
             model,

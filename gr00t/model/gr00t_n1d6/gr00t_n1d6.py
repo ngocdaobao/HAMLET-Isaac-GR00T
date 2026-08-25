@@ -308,16 +308,13 @@ class Gr00tN1d6ActionHead(nn.Module):
                 f"mem_ground_margin={self.mem_ground_margin}; otherwise the two edges of "
                 f"the band overlap and every row is penalized whatever the gap is."
             )
-        # Training-step counter driving the warmup schedule. Persistent so a resumed run
-        # picks the schedule back up instead of restarting it; absent from older
-        # checkpoints, where it loads as 0.
-        self.register_buffer(
-            "_mem_ground_step", torch.zeros((), dtype=torch.long), persistent=True
-        )
-        # Host-side mirror of that buffer. Reading the buffer itself would sync the
-        # device every step just to evaluate the schedule; this is seeded from it once
-        # (so a resumed run inherits the right step) and then tracked in lockstep.
-        self._mem_ground_step_host: int | None = None
+        # Training step driving the warmup schedule. A plain Python int, deliberately
+        # NOT a buffer: anything in the state dict has to exist in the base checkpoint
+        # too, and a step counter is run state rather than a weight. The trainer pushes
+        # its global_step in via `set_mem_ground_step` (which also makes resume Just
+        # Work, since HF restores global_step); without a trainer this self-increments.
+        self._mem_ground_step = 0
+        self._mem_ground_step_external = False
         if self.mem_ground_weight > 0:
             print(
                 f"Memory grounding: weight={self.mem_ground_weight} "
@@ -850,6 +847,18 @@ class Gr00tN1d6ActionHead(nn.Module):
         return features, am, im, None
 
     # ------------------------------------------------------------ memory grounding
+    def set_mem_ground_step(self, step: int) -> None:
+        """Point the grounding warmup at the trainer's global step.
+
+        Called once per training step by Gr00tTrainer. Preferred over the internal
+        fallback counter: it is the true optimizer step (not per-rank forwards, which
+        run ahead under gradient accumulation), it is identical across ranks, and HF
+        restores it on resume so the schedule picks up where it left off -- without
+        putting run state into the model's state dict.
+        """
+        self._mem_ground_step = int(step)
+        self._mem_ground_step_external = True
+
     def _mem_ground_scale(self) -> float:
         """Warmup multiplier on `mem_ground_weight` for the current step, in [0, 1].
 
@@ -858,7 +867,7 @@ class Gr00tN1d6ActionHead(nn.Module):
         transition both passes just predict the mean velocity: the gap is noise, and
         pushing on it only destabilizes the memory representation.
         """
-        step = self._mem_ground_step_host or 0
+        step = self._mem_ground_step
         if step < self.mem_ground_warmup_steps:
             return 0.0
         if self.mem_ground_ramp_steps <= 0:
@@ -1303,11 +1312,13 @@ class Gr00tN1d6ActionHead(nn.Module):
 
         # Drives the grounding warmup. Advanced before the memory paths run, because they
         # consult the schedule to decide whether to build the mismatched pass at all.
-        if self.training and self.mem_ground_weight > 0:
-            if self._mem_ground_step_host is None:
-                # One device read per process, picking up a resumed checkpoint's step.
-                self._mem_ground_step_host = int(self._mem_ground_step)
-            self._mem_ground_step_host += 1
+        if (
+            self.training
+            and self.mem_ground_weight > 0
+            and not self._mem_ground_step_external
+        ):
+            # Fallback only: counts forwards, so under gradient accumulation it runs
+            # ahead of the true optimizer step. `set_mem_ground_step` supersedes it.
             self._mem_ground_step += 1
 
         # K-step HAMLET: pass the action-input batch size so process_backbone_output can
